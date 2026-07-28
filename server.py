@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
 import uvicorn
 import logging
 import json
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
@@ -20,10 +21,10 @@ sys.stdout.reconfigure(encoding='utf-8')
 load_dotenv()
 
 
-
-# Configure logging
+# Configure logging. LOG_LEVEL=DEBUG surfaces the model mapping, stop_reason
+# corrections and tool-block diagnostics; the default stays quiet.
 logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "WARN").upper(), logging.WARN),
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
@@ -72,8 +73,20 @@ CONTENT_REPLACEMENTS = [
 ]
 
 def apply_content_replacements(messages: list) -> list:
-    """Apies regex replacements to message content before sending to the LLM."""
+    """Applies regex replacements to message content before sending to the LLM.
+
+    Disabled unless ENABLE_CONTENT_REPLACEMENTS=true. For a coding agent this
+    rewriting is actively destructive: the default rules rewrite every occurrence
+    of "claude"/"Anthropic" inside source files, paths and tool output, so the
+    model proposes edits against text that does not match the user's disk.
+    """
+    if not ENABLE_CONTENT_REPLACEMENTS:
+        return messages
+
     for msg in messages:
+        # Never rewrite tool results: they are verbatim command/file output.
+        if msg.get("role") == "tool":
+            continue
         content = msg.get("content")
         
         # 1. If content is a simple string (common for OpenAI/flattened messages)
@@ -186,6 +199,132 @@ OPENAI_MODELS = [
 # List of Gemini models
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 
+# Claude Code addresses three tiers. Previously only haiku/sonnet were mapped, so
+# every Opus request fell through unmapped and was sent verbatim to OpenAI.
+MIDDLE_MODEL = os.environ.get("MIDDLE_MODEL", BIG_MODEL)
+
+# Extra model ids the operator wants to expose, e.g. for a local vLLM / Ollama /
+# OpenRouter endpoint whose names we cannot know ahead of time.
+OPENAI_MODELS = OPENAI_MODELS + [
+    m.strip()
+    for m in os.environ.get("OPENAI_EXTRA_MODELS", "").split(",")
+    if m.strip()
+]
+
+# Output-token ceiling. The old code hardcoded 16384, which silently truncated
+# long edits on models that support far more.
+MAX_TOKENS_LIMIT = int(os.environ.get("MAX_TOKENS_LIMIT", "0")) or None
+
+# Some OpenAI-compatible gateways only understand `max_tokens` and reject
+# `max_completion_tokens`. Set FORCE_MAX_TOKENS_PARAM=max_tokens for those.
+MAX_TOKENS_PARAM = os.environ.get("FORCE_MAX_TOKENS_PARAM", "auto").lower()
+
+# The claude->Open text rewriting is destructive for a coding agent (it rewrites
+# source code, file paths and tool output). Off unless explicitly enabled.
+ENABLE_CONTENT_REPLACEMENTS = (
+    os.environ.get("ENABLE_CONTENT_REPLACEMENTS", "false").lower() == "true"
+)
+
+# Surface upstream reasoning traces as Anthropic thinking blocks. Default "auto":
+# only when the client actually asked for thinking. Emitting unrequested thinking
+# blocks (and with no valid signature, which we cannot produce for a non-Anthropic
+# backend) makes clients discard the message and end the turn silently. Set to
+# "always" to force, "never" to drop reasoning entirely.
+EMIT_REASONING = os.environ.get("EMIT_REASONING", "auto").lower()
+
+# Some OpenAI-compatible gateways reject the stream_options field outright.
+DISABLE_STREAM_OPTIONS = (
+    os.environ.get("DISABLE_STREAM_OPTIONS", "false").lower() == "true"
+)
+
+# DUMP_EVENTS=true logs every Anthropic SSE event the proxy emits, plus the
+# outgoing upstream payload. This is the fastest way to see what a client is
+# actually receiving when a turn ends unexpectedly.
+DUMP_EVENTS = os.environ.get("DUMP_EVENTS", "false").lower() == "true"
+
+
+def _should_emit_thinking(original_request) -> bool:
+    if EMIT_REASONING == "never":
+        return False
+    if EMIT_REASONING == "always":
+        return True
+    thinking = getattr(original_request, "thinking", None)
+    return bool(thinking is not None and thinking.is_enabled)
+
+# Reasoning models reject temperature/top_p/stop and need max_completion_tokens.
+REASONING_MODEL_PATTERN = re.compile(
+    r"^(o[1-4]|gpt-5|gpt-4\.5-preview|deepseek-r|qwq|grok-.*-reasoning)", re.IGNORECASE
+)
+
+
+def strip_provider_prefix(model: str) -> str:
+    for prefix in ("anthropic/", "openai/", "gemini/", "vertex_ai/", "azure/"):
+        if model.startswith(prefix):
+            return model[len(prefix) :]
+    return model
+
+
+def is_reasoning_model(model: str) -> bool:
+    """True for models that use the restricted reasoning-model parameter set."""
+    return bool(REASONING_MODEL_PATTERN.match(strip_provider_prefix(model)))
+
+
+def supports_temperature(model: str) -> bool:
+    return not is_reasoning_model(model)
+
+
+def map_model_name(v: str, context: str = "MODEL") -> str:
+    """Map an Anthropic model id onto the configured backend model.
+
+    Shared by MessagesRequest and TokenCountRequest so the two endpoints can never
+    disagree about which upstream model a request belongs to (they used to, which
+    made Claude Code's context math wrong).
+    """
+    original_model = v
+    clean_v = strip_provider_prefix(v)
+    lowered = clean_v.lower()
+
+    def _target(model_name: str) -> str:
+        # Respect an explicit prefix in the env var, e.g. BIG_MODEL="openrouter/x".
+        if "/" in model_name:
+            return model_name
+        if PREFERRED_PROVIDER == "google" and model_name in GEMINI_MODELS:
+            return f"gemini/{model_name}"
+        if PREFERRED_PROVIDER not in ("openai", "google", "anthropic"):
+            return f"{PREFERRED_PROVIDER}/{model_name}"
+        return f"openai/{model_name}"
+
+    new_model = v
+    mapped = False
+
+    if PREFERRED_PROVIDER == "anthropic":
+        new_model = f"anthropic/{clean_v}"
+        mapped = True
+    elif "haiku" in lowered:
+        new_model = _target(SMALL_MODEL)
+        mapped = True
+    elif "sonnet" in lowered:
+        new_model = _target(BIG_MODEL)
+        mapped = True
+    elif "opus" in lowered:
+        new_model = _target(MIDDLE_MODEL)
+        mapped = True
+    elif clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
+        new_model = f"gemini/{clean_v}"
+        mapped = True
+    elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
+        new_model = f"openai/{clean_v}"
+        mapped = True
+    elif not v.startswith(("openai/", "gemini/", "anthropic/")):
+        # Unknown id and no prefix: assume it belongs to the configured provider
+        # rather than shipping a bare name LiteLLM will try to route to Anthropic.
+        new_model = _target(clean_v)
+        mapped = True
+
+    if mapped:
+        logger.debug(f"📌 {context} MAPPING: '{original_model}' ➡️ '{new_model}'")
+    return new_model
+
 
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
@@ -216,221 +355,180 @@ def clean_gemini_schema(schema: Any) -> Any:
 
 
 # Models for Anthropic API requests
+#
+# NOTE: every block model allows extra fields. Real Anthropic clients (Claude Code
+# in particular) attach `cache_control`, `citations`, `signature`, etc. to blocks.
+# Rejecting those with a 422 is the single most common cause of "the proxy works
+# with curl but not with Claude Code".
 class ContentBlockText(BaseModel):
+    model_config = {"extra": "allow"}
     type: Literal["text"]
     text: str
 
 
 class ContentBlockImage(BaseModel):
+    model_config = {"extra": "allow"}
     type: Literal["image"]
     source: Dict[str, Any]
 
 
+class ContentBlockDocument(BaseModel):
+    """PDF / plain-text document blocks (Anthropic 'document' content block)."""
+
+    model_config = {"extra": "allow"}
+    type: Literal["document"]
+    source: Dict[str, Any]
+    title: Optional[str] = None
+    context: Optional[str] = None
+
+
+class ContentBlockThinking(BaseModel):
+    """Extended-thinking block echoed back in assistant turns."""
+
+    model_config = {"extra": "allow"}
+    type: Literal["thinking"]
+    thinking: str = ""
+    signature: Optional[str] = None
+
+
+class ContentBlockRedactedThinking(BaseModel):
+    model_config = {"extra": "allow"}
+    type: Literal["redacted_thinking"]
+    data: Optional[str] = None
+
+
 class ContentBlockToolUse(BaseModel):
+    model_config = {"extra": "allow"}
     type: Literal["tool_use"]
     id: str
     name: str
-    input: Dict[str, Any]
+    input: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ContentBlockToolResult(BaseModel):
+    model_config = {"extra": "allow"}
     type: Literal["tool_result"]
     tool_use_id: str
-    content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any]
+    content: Union[str, List[Dict[str, Any]], Dict[str, Any], List[Any], Any] = ""
+    # Anthropic signals failed tool calls with is_error=True. Dropping this makes
+    # the model think every failed command succeeded.
+    is_error: Optional[bool] = None
+
+
+# Any block type we do not model explicitly (server_tool_use, web_search_tool_result,
+# mcp_tool_use, future additions...) falls through to this instead of 422-ing.
+class ContentBlockUnknown(BaseModel):
+    model_config = {"extra": "allow"}
+    type: str
+
+
+AnyContentBlock = Union[
+    ContentBlockText,
+    ContentBlockImage,
+    ContentBlockDocument,
+    ContentBlockThinking,
+    ContentBlockRedactedThinking,
+    ContentBlockToolUse,
+    ContentBlockToolResult,
+    ContentBlockUnknown,
+]
 
 
 class SystemContent(BaseModel):
+    model_config = {"extra": "allow"}
     type: Literal["text"]
     text: str
 
 
 class Message(BaseModel):
-    role: Literal["user", "assistant", "system"]
-    content: Union[
-        str,
-        List[
-            Union[
-                ContentBlockText,
-                ContentBlockImage,
-                ContentBlockToolUse,
-                ContentBlockToolResult,
-            ]
-        ],
-    ]
+    model_config = {"extra": "allow"}
+    # Anthropic's Messages API only accepts user/assistant here; system goes in the
+    # top-level `system` field. We stay permissive on input and normalize later.
+    role: str
+    content: Union[str, List[AnyContentBlock]]
 
 
 class Tool(BaseModel):
+    model_config = {"extra": "allow"}
     name: str
     description: Optional[str] = None
-    input_schema: Dict[str, Any]
+    input_schema: Dict[str, Any] = Field(default_factory=dict)
+    # Anthropic server-side tools (web_search, text_editor, bash...) carry a `type`
+    # instead of a schema. They have no OpenAI equivalent and must be dropped.
+    type: Optional[str] = None
 
 
 class ThinkingConfig(BaseModel):
+    """Anthropic sends {"type": "enabled"|"disabled", "budget_tokens": N}."""
+
+    model_config = {"extra": "allow"}
+    type: Optional[str] = None
+    budget_tokens: Optional[int] = None
     enabled: bool = True
+
+    @property
+    def is_enabled(self) -> bool:
+        if self.type is not None:
+            return self.type != "disabled"
+        return self.enabled
 
 
 class MessagesRequest(BaseModel):
+    model_config = {"extra": "allow"}
     model: str
     max_tokens: int
     messages: List[Message]
     system: Optional[Union[str, List[SystemContent]]] = None
     stop_sequences: Optional[List[str]] = None
     stream: Optional[bool] = False
-    temperature: Optional[float] = 1.0
+    # Default None (not 1.0): sending an explicit temperature to a reasoning model
+    # is a hard 400, and forwarding a default the caller never set is wrong anyway.
+    temperature: Optional[float] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     metadata: Optional[Dict[str, Any]] = None
     tools: Optional[List[Tool]] = None
-    tool_choice: Optional[Dict[str, Any]] = None
+    tool_choice: Optional[Union[Dict[str, Any], str]] = None
     thinking: Optional[ThinkingConfig] = None
     original_model: Optional[str] = None  # Will store the original model name
 
+    # mode="before" is required: a field_validator cannot populate a *sibling*
+    # field. The previous code assigned into `info.data`, which Pydantic v2
+    # discards, so original_model was always None and every response echoed the
+    # mapped backend id (e.g. "openai/gpt-4.1") instead of the model the client
+    # asked for. Claude Code compares that field against what it sent.
+    @model_validator(mode="before")
+    @classmethod
+    def capture_original_model(cls, data):
+        if isinstance(data, dict) and data.get("model") is not None:
+            data.setdefault("original_model", data["model"])
+        return data
+
     @field_validator("model")
-    def validate_model_field(cls, v, info):  # Renamed to avoid conflict
-        original_model = v
-        new_model = v  # Default to original value
-
-        logger.debug(
-            f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
-        )
-
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith("anthropic/"):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith("openai/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("gemini/"):
-            clean_v = clean_v[7:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        if PREFERRED_PROVIDER == "anthropic":
-            # Don't remap to big/small models, just add the prefix
-            new_model = f"anthropic/{clean_v}"
-            mapped = True
-
-        # Map Haiku to SMALL_MODEL based on provider preference
-        elif "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-                new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-            elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-        # --- Mapping Logic --- END ---
-
-        if mapped:
-            logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
-        else:
-            # If no mapping occurred and no prefix exists, log warning or decide default
-            if not v.startswith(("openai/", "gemini/", "anthropic/")):
-                logger.warning(
-                    f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is."
-                )
-            new_model = v  # Ensure we return the original if no rule applied
-
-        # Store the original model in the values dictionary
-        values = info.data
-        if isinstance(values, dict):
-            values["original_model"] = original_model
-
-        return new_model
+    def validate_model_field(cls, v, info):
+        return map_model_name(v, "MODEL")
 
 
 class TokenCountRequest(BaseModel):
+    model_config = {"extra": "allow"}
     model: str
     messages: List[Message]
     system: Optional[Union[str, List[SystemContent]]] = None
     tools: Optional[List[Tool]] = None
     thinking: Optional[ThinkingConfig] = None
-    tool_choice: Optional[Dict[str, Any]] = None
+    tool_choice: Optional[Union[Dict[str, Any], str]] = None
     original_model: Optional[str] = None  # Will store the original model name
 
+    @model_validator(mode="before")
+    @classmethod
+    def capture_original_model(cls, data):
+        if isinstance(data, dict) and data.get("model") is not None:
+            data.setdefault("original_model", data["model"])
+        return data
+
     @field_validator("model")
-    def validate_model_token_count(cls, v, info):  # Renamed to avoid conflict
-        # Use the same logic as MessagesRequest validator
-        # NOTE: Pydantic validators might not share state easily if not class methods
-        # Re-implementing the logic here for clarity, could be refactored
-        original_model = v
-        new_model = v  # Default to original value
-
-        logger.debug(
-            f"📋 TOKEN COUNT VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
-        )
-
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith("anthropic/"):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith("openai/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("gemini/"):
-            clean_v = clean_v[7:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        # Map Haiku to SMALL_MODEL based on provider preference
-        if "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
-
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-                mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-                new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-            elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-        # --- Mapping Logic --- END ---
-
-        if mapped:
-            logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
-        else:
-            if not v.startswith(("openai/", "gemini/", "anthropic/")):
-                logger.warning(
-                    f"⚠️ No prefix or mapping rule for token count model: '{original_model}'. Using as is."
-                )
-            new_model = v  # Ensure we return the original if no rule applied
-
-        # Store the original model in the values dictionary
-        values = info.data
-        if isinstance(values, dict):
-            values["original_model"] = original_model
-
-        return new_model
+    def validate_model_token_count(cls, v, info):
+        return map_model_name(v, "TOKEN COUNT")
 
 
 class TokenCountResponse(BaseModel):
@@ -448,10 +546,12 @@ class MessagesResponse(BaseModel):
     id: str
     model: str
     role: Literal["assistant"] = "assistant"
-    content: List[Union[ContentBlockText, ContentBlockToolUse]]
+    content: List[Union[ContentBlockText, ContentBlockThinking, ContentBlockToolUse]]
     type: Literal["message"] = "message"
     stop_reason: Optional[
-        Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
+        Literal[
+            "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
+        ]
     ] = None
     stop_sequence: Optional[str] = None
     usage: Usage
@@ -486,319 +586,608 @@ async def log_requests(request: Request, call_next):
 # Not using validation function as we're using the environment API key
 
 
-def parse_tool_result_content(content):
-    """Helper function to properly parse and normalize tool result content."""
-    if content is None:
-        return "No content provided"
+# NOTE: parse_tool_result_content() was removed here. Tool results are now
+# normalized by _tool_result_to_text(), which is used by the real tool-message
+# conversion path rather than the old stringify-into-prose path.
 
+
+
+def _block_get(block, key, default=None):
+    """Read a field off either a pydantic block model or a plain dict."""
+    if isinstance(block, dict):
+        return block.get(key, default)
+    return getattr(block, key, default)
+
+
+def _sanitize_json_schema_for_openai(schema: Any) -> Any:
+    """Strip JSON-Schema keywords that OpenAI-compatible backends reject.
+
+    Anthropic tool schemas are full JSON Schema. Many OpenAI-compatible servers
+    (vLLM, Ollama, Azure, several gateways) hard-fail on $schema/$id or on exotic
+    string formats, which shows up as a blanket 400 on every request that carries
+    Claude Code's toolset.
+    """
+    if isinstance(schema, list):
+        return [_sanitize_json_schema_for_openai(i) for i in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    drop_keys = {"$schema", "$id", "$comment", "additionalItems", "cache_control"}
+    allowed_string_formats = {"date-time", "date", "time", "duration", "email", "uuid"}
+
+    out = {}
+    for key, value in schema.items():
+        if key in drop_keys:
+            continue
+        if key == "format" and schema.get("type") == "string":
+            if value not in allowed_string_formats:
+                continue
+        if key in ("properties", "$defs", "definitions") and isinstance(value, dict):
+            out[key] = {k: _sanitize_json_schema_for_openai(v) for k, v in value.items()}
+        elif key in ("items", "additionalProperties"):
+            out[key] = _sanitize_json_schema_for_openai(value)
+        elif key in ("anyOf", "oneOf", "allOf", "prefixItems") and isinstance(value, list):
+            out[key] = [_sanitize_json_schema_for_openai(v) for v in value]
+        else:
+            out[key] = _sanitize_json_schema_for_openai(value)
+
+    # An object schema with no `properties` is rejected by strict validators.
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
+def _anthropic_image_to_openai(source: Any) -> Optional[Dict[str, Any]]:
+    """Convert an Anthropic image source into an OpenAI image_url part.
+
+    The old code passed Anthropic's {"type":"image","source":{...}} through
+    untouched and then replaced it with the literal string
+    '[Image content - not displayed in text format]', so screenshots and pasted
+    images silently never reached the model.
+    """
+    if not isinstance(source, dict):
+        return None
+    src_type = source.get("type")
+    if src_type == "base64":
+        media_type = source.get("media_type", "image/png")
+        data = source.get("data", "")
+        if not data:
+            return None
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{data}"},
+        }
+    if src_type == "url" and source.get("url"):
+        return {"type": "image_url", "image_url": {"url": source["url"]}}
+    return None
+
+
+def _normalize_openai_content(parts: List[Dict[str, Any]]) -> Union[str, List[Dict[str, Any]], None]:
+    """Collapse to a plain string when there is no multimodal part.
+
+    Plain strings are accepted by every OpenAI-compatible server; the parts array
+    is not (older/self-hosted endpoints often reject it), so only use it when an
+    image actually needs to be carried.
+    """
+    if not parts:
+        return None
+    if all(p.get("type") == "text" for p in parts):
+        text = "\n".join(p.get("text", "") for p in parts if p.get("text"))
+        return text
+    return parts
+
+
+def _tool_result_to_text(content: Any) -> str:
+    """Flatten Anthropic tool_result content into the string OpenAI expects."""
+    if content is None:
+        return ""
     if isinstance(content, str):
         return content
-
     if isinstance(content, list):
-        result = ""
+        chunks = []
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                result += item.get("text", "") + "\n"
+            item_type = _block_get(item, "type")
+            if item_type == "text":
+                chunks.append(_block_get(item, "text", "") or "")
+            elif item_type == "image":
+                # OpenAI tool messages cannot carry images; note it instead of
+                # dropping it silently so the model knows something was returned.
+                chunks.append("[image omitted: tool results cannot carry images]")
             elif isinstance(item, str):
-                result += item + "\n"
-            elif isinstance(item, dict):
-                if "text" in item:
-                    result += item.get("text", "") + "\n"
-                else:
-                    try:
-                        result += json.dumps(item) + "\n"
-                    except:
-                        result += str(item) + "\n"
+                chunks.append(item)
             else:
                 try:
-                    result += str(item) + "\n"
-                except:
-                    result += "Unparseable content\n"
-        return result.strip()
-
+                    chunks.append(
+                        json.dumps(item if isinstance(item, dict) else str(item))
+                    )
+                except Exception:
+                    chunks.append(str(item))
+        return "\n".join(c for c in chunks if c)
     if isinstance(content, dict):
         if content.get("type") == "text":
             return content.get("text", "")
         try:
             return json.dumps(content)
-        except:
+        except Exception:
             return str(content)
+    return str(content)
 
-    # Fallback for any other type
-    try:
-        return str(content)
-    except:
-        return "Unparseable content"
+
+def _system_role_for(model: str) -> Optional[str]:
+    """Pick the role name the target model accepts for system instructions."""
+    clean = strip_provider_prefix(model).lower()
+    # o1-mini / o1-preview accept no system-ish role at all.
+    if clean.startswith("o1-mini") or clean.startswith("o1-preview"):
+        return None
+    if is_reasoning_model(model):
+        return "developer"
+    return "system"
 
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
-    """Convert Anthropic API request format to LiteLLM format (which follows OpenAI)."""
-    # LiteLLM already handles Anthropic models when using the format model="anthropic/claude-3-opus-20240229"
-    # So we just need to convert our Pydantic model to a dict in the expected format
+    """Convert an Anthropic Messages request into OpenAI/LiteLLM shape.
 
-    messages = []
+    The important part is that Anthropic tool_use / tool_result blocks become real
+    OpenAI `tool_calls` and `role:"tool"` messages. The previous implementation
+    stringified them ("Tool result for toolu_123: ..."), which destroyed the
+    tool-calling contract: the backend never saw a structured call/result pair, so
+    multi-turn agentic loops degraded into the model re-describing tools in prose.
+    """
+    target_model = anthropic_request.model
+    messages: List[Dict[str, Any]] = []
 
-    # Add system message if present
+    # ---------- system ----------
+    system_text = ""
     if anthropic_request.system:
-        # Handle different formats of system messages
         if isinstance(anthropic_request.system, str):
-            # Simple string format
-            messages.append({"role": "system", "content": anthropic_request.system})
+            system_text = anthropic_request.system
         elif isinstance(anthropic_request.system, list):
-            # List of content blocks
-            system_text = ""
+            parts = []
             for block in anthropic_request.system:
-                if hasattr(block, "type") and block.type == "text":
-                    system_text += block.text + "\n\n"
-                elif isinstance(block, dict) and block.get("type") == "text":
-                    system_text += block.get("text", "") + "\n\n"
+                if _block_get(block, "type") == "text":
+                    parts.append(_block_get(block, "text", "") or "")
+            system_text = "\n\n".join(p for p in parts if p)
 
-            if system_text:
-                messages.append({"role": "system", "content": system_text.strip()})
-
-    # Add conversation messages
-    for idx, msg in enumerate(anthropic_request.messages):
-        content = msg.content
-        if isinstance(content, str):
-            messages.append({"role": msg.role, "content": content})
+    system_role = _system_role_for(target_model)
+    pending_system_prefix = ""
+    if system_text.strip():
+        if system_role is None:
+            # Fold into the first user turn for models with no system role.
+            pending_system_prefix = system_text.strip() + "\n\n"
         else:
-            # Special handling for tool_result in user messages
-            # OpenAI/LiteLLM format expects the assistant to call the tool,
-            # and the user's next message to include the result as plain text
-            if msg.role == "user" and any(
-                block.type == "tool_result"
-                for block in content
-                if hasattr(block, "type")
-            ):
-                # For user messages with tool_result, split into separate messages
-                text_content = ""
+            messages.append({"role": system_role, "content": system_text.strip()})
 
-                # Extract all text parts and concatenate them
-                for block in content:
-                    if hasattr(block, "type"):
-                        if block.type == "text":
-                            text_content += block.text + "\n"
-                        elif block.type == "tool_result":
-                            # Add tool result as a message by itself - simulate the normal flow
-                            tool_id = (
-                                block.tool_use_id
-                                if hasattr(block, "tool_use_id")
-                                else ""
-                            )
+    # ---------- conversation ----------
+    # Track which tool_use ids the assistant actually emitted. OpenAI returns a hard
+    # 400 for a tool message whose tool_call_id was never announced, and for an
+    # assistant tool_calls entry with no matching tool reply.
+    announced_tool_ids: set = set()
+    satisfied_tool_ids: set = set()
 
-                            # Handle different formats of tool result content
-                            result_content = ""
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    result_content = block.content
-                                elif isinstance(block.content, list):
-                                    # If content is a list of blocks, extract text from each
-                                    for content_block in block.content:
-                                        if (
-                                            hasattr(content_block, "type")
-                                            and content_block.type == "text"
-                                        ):
-                                            result_content += content_block.text + "\n"
-                                        elif (
-                                            isinstance(content_block, dict)
-                                            and content_block.get("type") == "text"
-                                        ):
-                                            result_content += (
-                                                content_block.get("text", "") + "\n"
-                                            )
-                                        elif isinstance(content_block, dict):
-                                            # Handle any dict by trying to extract text or convert to JSON
-                                            if "text" in content_block:
-                                                result_content += (
-                                                    content_block.get("text", "") + "\n"
-                                                )
-                                            else:
-                                                try:
-                                                    result_content += (
-                                                        json.dumps(content_block) + "\n"
-                                                    )
-                                                except:
-                                                    result_content += (
-                                                        str(content_block) + "\n"
-                                                    )
-                                elif isinstance(block.content, dict):
-                                    # Handle dictionary content
-                                    if block.content.get("type") == "text":
-                                        result_content = block.content.get("text", "")
-                                    else:
-                                        try:
-                                            result_content = json.dumps(block.content)
-                                        except:
-                                            result_content = str(block.content)
-                                else:
-                                    # Handle any other type by converting to string
-                                    try:
-                                        result_content = str(block.content)
-                                    except:
-                                        result_content = "Unparseable content"
+    for msg in anthropic_request.messages:
+        role = msg.role if msg.role in ("user", "assistant") else "user"
+        content = msg.content
 
-                            # In OpenAI format, tool results come from the user (rather than being content blocks)
-                            text_content += (
-                                f"Tool result for {tool_id}:\n{result_content}\n"
-                            )
+        if isinstance(content, str):
+            text = content
+            if pending_system_prefix and role == "user":
+                text = pending_system_prefix + text
+                pending_system_prefix = ""
+            messages.append({"role": role, "content": text})
+            continue
 
-                # Add as a single user message with all the content
-                messages.append({"role": "user", "content": text_content.strip()})
+        blocks = content or []
+
+        if role == "assistant":
+            text_parts: List[Dict[str, Any]] = []
+            tool_calls: List[Dict[str, Any]] = []
+            for block in blocks:
+                btype = _block_get(block, "type")
+                if btype == "text":
+                    t = _block_get(block, "text", "") or ""
+                    if t:
+                        text_parts.append({"type": "text", "text": t})
+                elif btype == "tool_use":
+                    tool_id = _block_get(block, "id") or f"call_{uuid.uuid4().hex[:24]}"
+                    tool_input = _block_get(block, "input", {})
+                    if not isinstance(tool_input, dict):
+                        tool_input = {"value": tool_input}
+                    announced_tool_ids.add(tool_id)
+                    tool_calls.append(
+                        {
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {
+                                "name": _block_get(block, "name", "") or "unknown",
+                                "arguments": json.dumps(tool_input, ensure_ascii=False),
+                            },
+                        }
+                    )
+                elif btype in ("thinking", "redacted_thinking"):
+                    # Reasoning traces are provider-specific and are not replayable
+                    # as assistant content on OpenAI; drop them from history.
+                    continue
+
+            assistant_msg: Dict[str, Any] = {"role": "assistant"}
+            normalized = _normalize_openai_content(text_parts)
+            if tool_calls:
+                # content may be null alongside tool_calls, and must be when empty.
+                assistant_msg["content"] = normalized if normalized else None
+                assistant_msg["tool_calls"] = tool_calls
             else:
-                # Regular handling for other message types
-                processed_content = []
-                for block in content:
-                    if hasattr(block, "type"):
-                        if block.type == "text":
-                            processed_content.append(
-                                {"type": "text", "text": block.text}
-                            )
-                        elif block.type == "image":
-                            processed_content.append(
-                                {"type": "image", "source": block.source}
-                            )
-                        elif block.type == "tool_use":
-                            # Handle tool use blocks if needed
-                            processed_content.append(
-                                {
-                                    "type": "tool_use",
-                                    "id": block.id,
-                                    "name": block.name,
-                                    "input": block.input,
-                                }
-                            )
-                        elif block.type == "tool_result":
-                            # Handle different formats of tool result content
-                            processed_content_block = {
-                                "type": "tool_result",
-                                "tool_use_id": block.tool_use_id
-                                if hasattr(block, "tool_use_id")
-                                else "",
-                            }
+                assistant_msg["content"] = normalized if normalized else ""
+            messages.append(assistant_msg)
+            continue
 
-                            # Process the content field properly
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    # If it's a simple string, create a text block for it
-                                    processed_content_block["content"] = [
-                                        {"type": "text", "text": block.content}
-                                    ]
-                                elif isinstance(block.content, list):
-                                    # If it's already a list of blocks, keep it
-                                    processed_content_block["content"] = block.content
-                                else:
-                                    # Default fallback
-                                    processed_content_block["content"] = [
-                                        {"type": "text", "text": str(block.content)}
-                                    ]
-                            else:
-                                # Default empty content
-                                processed_content_block["content"] = [
-                                    {"type": "text", "text": ""}
-                                ]
+        # ----- user turn -----
+        # Tool results must be emitted as their own `tool` messages, immediately
+        # after the assistant call and before any new user text.
+        tool_messages: List[Dict[str, Any]] = []
+        user_parts: List[Dict[str, Any]] = []
 
-                            processed_content.append(processed_content_block)
+        for block in blocks:
+            btype = _block_get(block, "type")
+            if btype == "tool_result":
+                tool_use_id = _block_get(block, "tool_use_id") or ""
+                result_text = _tool_result_to_text(_block_get(block, "content", ""))
+                if _block_get(block, "is_error"):
+                    result_text = f"Error: {result_text}" if result_text else "Error"
+                if not result_text:
+                    result_text = "(no output)"
+                if tool_use_id and tool_use_id in announced_tool_ids:
+                    satisfied_tool_ids.add(tool_use_id)
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_use_id,
+                            "content": result_text,
+                        }
+                    )
+                else:
+                    # Orphaned result (no matching call in this window, e.g. after
+                    # client-side history truncation). Demote to user text rather
+                    # than letting the backend 400 the whole request.
+                    logger.debug(
+                        f"Orphan tool_result {tool_use_id!r}; demoting to user text"
+                    )
+                    user_parts.append(
+                        {"type": "text", "text": f"Tool result:\n{result_text}"}
+                    )
+            elif btype == "text":
+                t = _block_get(block, "text", "") or ""
+                if t:
+                    user_parts.append({"type": "text", "text": t})
+            elif btype == "image":
+                part = _anthropic_image_to_openai(_block_get(block, "source"))
+                if part:
+                    user_parts.append(part)
+            elif btype == "document":
+                src = _block_get(block, "source") or {}
+                if isinstance(src, dict) and src.get("type") == "text":
+                    user_parts.append(
+                        {"type": "text", "text": src.get("data", "") or ""}
+                    )
+                else:
+                    user_parts.append(
+                        {"type": "text", "text": "[document omitted: unsupported by backend]"}
+                    )
 
-                messages.append({"role": msg.role, "content": processed_content})
+        messages.extend(tool_messages)
 
-    # Cap max_tokens for OpenAI models to their limit of 16384
+        if pending_system_prefix and user_parts:
+            user_parts.insert(0, {"type": "text", "text": pending_system_prefix.strip()})
+            pending_system_prefix = ""
+
+        normalized_user = _normalize_openai_content(user_parts)
+        if normalized_user:
+            messages.append({"role": "user", "content": normalized_user})
+
+    # Any tool_call the assistant announced but that has no reply must be answered,
+    # or OpenAI rejects the conversation outright.
+    messages = _repair_tool_call_pairs(messages)
+
+    # ---------- parameters ----------
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith(
-        "openai/"
-    ) or anthropic_request.model.startswith("gemini/"):
-        max_tokens = min(max_tokens, 16384)
-        logger.debug(
-            f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})"
-        )
+    if MAX_TOKENS_LIMIT:
+        max_tokens = min(max_tokens, MAX_TOKENS_LIMIT)
 
-    # Create LiteLLM request dict
-    litellm_request = {
-        "model": anthropic_request.model,  # it understands "anthropic/claude-x" format
+    litellm_request: Dict[str, Any] = {
+        "model": target_model,
         "messages": messages,
-        "max_completion_tokens": max_tokens,
-        "temperature": anthropic_request.temperature,
-        "stream": anthropic_request.stream,
+        "stream": bool(anthropic_request.stream),
     }
 
-    # INJECT CUSTOM HEADERS TO UPSTREAM PROXIED REQUESTS
+    # Reasoning models require max_completion_tokens; some gateways only know
+    # max_tokens. `auto` picks per-model, and the env var forces one.
+    if MAX_TOKENS_PARAM == "max_tokens":
+        litellm_request["max_tokens"] = max_tokens
+    elif MAX_TOKENS_PARAM == "max_completion_tokens":
+        litellm_request["max_completion_tokens"] = max_tokens
+    elif is_reasoning_model(target_model):
+        litellm_request["max_completion_tokens"] = max_tokens
+    else:
+        litellm_request["max_tokens"] = max_tokens
+
+    # Reasoning models reject temperature / top_p / top_k / stop outright.
+    if supports_temperature(target_model):
+        if anthropic_request.temperature is not None:
+            litellm_request["temperature"] = anthropic_request.temperature
+        if anthropic_request.top_p is not None:
+            litellm_request["top_p"] = anthropic_request.top_p
+        if anthropic_request.top_k is not None and target_model.startswith("gemini/"):
+            # top_k is not an OpenAI parameter; only forward where it is real.
+            litellm_request["top_k"] = anthropic_request.top_k
+        if anthropic_request.stop_sequences:
+            # OpenAI caps `stop` at 4 entries.
+            litellm_request["stop"] = anthropic_request.stop_sequences[:4]
+
+    # Map Anthropic's thinking budget onto OpenAI's reasoning_effort.
+    if anthropic_request.thinking is not None and anthropic_request.thinking.is_enabled:
+        if target_model.startswith("anthropic/"):
+            thinking_payload = {"type": "enabled"}
+            if anthropic_request.thinking.budget_tokens:
+                thinking_payload["budget_tokens"] = anthropic_request.thinking.budget_tokens
+            litellm_request["thinking"] = thinking_payload
+        elif is_reasoning_model(target_model):
+            budget = anthropic_request.thinking.budget_tokens or 0
+            if budget and budget <= 4096:
+                litellm_request["reasoning_effort"] = "low"
+            elif budget and budget >= 16384:
+                litellm_request["reasoning_effort"] = "high"
+            else:
+                litellm_request["reasoning_effort"] = "medium"
+
+    # Streaming usage is opt-in on OpenAI. Without this the proxy reported
+    # output_tokens: 0 for every streamed reply and Claude Code's context meter
+    # never moved. Some third-party gateways reject the unknown field, so it can
+    # be turned off with DISABLE_STREAM_OPTIONS=true.
+    if anthropic_request.stream and not DISABLE_STREAM_OPTIONS:
+        litellm_request["stream_options"] = {"include_usage": True}
+
+    # metadata.user_id -> `user` (abuse-tracking / caching hints)
+    if anthropic_request.metadata and isinstance(anthropic_request.metadata, dict):
+        user_id = anthropic_request.metadata.get("user_id")
+        if isinstance(user_id, str) and user_id:
+            litellm_request["user"] = user_id[:128]
+
     if CUSTOM_HEADERS:
-        litellm_request["extra_headers"] = CUSTOM_HEADERS
+        litellm_request["extra_headers"] = dict(CUSTOM_HEADERS)
 
-    # Only include thinking field for Anthropic models
-    if anthropic_request.thinking and anthropic_request.model.startswith("anthropic/"):
-        litellm_request["thinking"] = anthropic_request.thinking
-
-    # Add optional parameters if present
-    if anthropic_request.stop_sequences:
-        litellm_request["stop"] = anthropic_request.stop_sequences
-
-    if anthropic_request.top_p:
-        litellm_request["top_p"] = anthropic_request.top_p
-
-    if anthropic_request.top_k:
-        litellm_request["top_k"] = anthropic_request.top_k
-
-    # Convert tools to OpenAI format
+    # ---------- tools ----------
     if anthropic_request.tools:
         openai_tools = []
-        is_gemini_model = anthropic_request.model.startswith("gemini/")
-
+        is_gemini_model = target_model.startswith("gemini/")
         for tool in anthropic_request.tools:
-            # Convert to dict if it's a pydantic model
-            if hasattr(tool, "dict"):
-                tool_dict = tool.dict()
-            else:
-                # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
-                try:
-                    tool_dict = dict(tool) if not isinstance(tool, dict) else tool
-                except (TypeError, ValueError):
-                    logger.error(f"Could not convert tool to dict: {tool}")
-                    continue  # Skip this tool if conversion fails
+            tool_dict = (
+                tool.model_dump(exclude_none=True)
+                if hasattr(tool, "model_dump")
+                else dict(tool)
+            )
+            name = tool_dict.get("name")
+            if not name:
+                continue
+            # Anthropic server-side tools have a `type` and no usable schema.
+            if tool_dict.get("type") and not tool_dict.get("input_schema"):
+                logger.warning(f"Dropping unsupported server-side tool: {name}")
+                continue
 
-            # Clean the schema if targeting a Gemini model
-            input_schema = tool_dict.get("input_schema", {})
+            input_schema = tool_dict.get("input_schema") or {
+                "type": "object",
+                "properties": {},
+            }
             if is_gemini_model:
-                logger.debug(
-                    f"Cleaning schema for Gemini tool: {tool_dict.get('name')}"
-                )
                 input_schema = clean_gemini_schema(input_schema)
+            else:
+                input_schema = _sanitize_json_schema_for_openai(input_schema)
 
-            # Create OpenAI-compatible function tool
-            openai_tool = {
-                "type": "function",
-                "function": {
-                    "name": tool_dict["name"],
-                    "description": tool_dict.get("description", ""),
-                    "parameters": input_schema,  # Use potentially cleaned schema
-                },
-            }
-            openai_tools.append(openai_tool)
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool_dict.get("description", "") or "",
+                        "parameters": input_schema,
+                    },
+                }
+            )
+        if openai_tools:
+            litellm_request["tools"] = openai_tools
 
-        litellm_request["tools"] = openai_tools
-
-    # Convert tool_choice to OpenAI format if present
-    if anthropic_request.tool_choice:
-        if hasattr(anthropic_request.tool_choice, "dict"):
-            tool_choice_dict = anthropic_request.tool_choice.dict()
+    # ---------- tool_choice ----------
+    if anthropic_request.tool_choice is not None and litellm_request.get("tools"):
+        tc = anthropic_request.tool_choice
+        if isinstance(tc, str):
+            litellm_request["tool_choice"] = tc
         else:
-            tool_choice_dict = anthropic_request.tool_choice
+            choice_type = tc.get("type")
+            if choice_type == "auto":
+                litellm_request["tool_choice"] = "auto"
+            elif choice_type == "any":
+                # Anthropic "any" == must call some tool == OpenAI "required".
+                # The old code forwarded the literal "any", which OpenAI rejects.
+                litellm_request["tool_choice"] = "required"
+            elif choice_type == "none":
+                litellm_request["tool_choice"] = "none"
+            elif choice_type == "tool" and tc.get("name"):
+                litellm_request["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tc["name"]},
+                }
+            else:
+                litellm_request["tool_choice"] = "auto"
 
-        # Handle Anthropic's tool_choice format
-        choice_type = tool_choice_dict.get("type")
-        if choice_type == "auto":
-            litellm_request["tool_choice"] = "auto"
-        elif choice_type == "any":
-            litellm_request["tool_choice"] = "any"
-        elif choice_type == "tool" and "name" in tool_choice_dict:
-            litellm_request["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tool_choice_dict["name"]},
-            }
-        else:
-            # Default to auto if we can't determine
-            litellm_request["tool_choice"] = "auto"
+            # Anthropic disables parallel calls via the tool_choice object.
+            if tc.get("disable_parallel_tool_use") is True:
+                litellm_request["parallel_tool_calls"] = False
 
     return litellm_request
+
+
+def _repair_tool_call_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Guarantee every assistant tool_call is followed by a matching tool message.
+
+    Claude Code truncates history mid-loop and users hit ESC between a tool call
+    and its result, both of which leave dangling calls that OpenAI rejects with
+    "messages with role 'tool' must be a response to a preceding message with
+    'tool_calls'".
+    """
+    repaired: List[Dict[str, Any]] = []
+    for idx, msg in enumerate(messages):
+        repaired.append(msg)
+        tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+        if not tool_calls:
+            continue
+
+        # Collect the tool replies that immediately follow this assistant message.
+        replied = set()
+        j = idx + 1
+        while j < len(messages) and messages[j].get("role") == "tool":
+            replied.add(messages[j].get("tool_call_id"))
+            j += 1
+
+        for call in tool_calls:
+            if call.get("id") not in replied:
+                logger.debug(f"Synthesizing missing tool result for {call.get('id')}")
+                repaired.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id"),
+                        "content": "(tool call was interrupted; no result returned)",
+                    }
+                )
+    return repaired
+
+
+OPENAI_MESSAGE_KEYS = {"role", "content", "name", "tool_call_id", "tool_calls"}
+
+
+def _validate_openai_messages(litellm_request: Dict[str, Any]) -> None:
+    """Last-mile sanity pass on the outgoing message array (mutates in place).
+
+    Everything structural is already handled by the converter; this only guards
+    against the invariants that make OpenAI-compatible servers return a bare 400.
+    """
+    messages = litellm_request.get("messages") or []
+    cleaned: List[Dict[str, Any]] = []
+
+    for msg in messages:
+        # Drop any key OpenAI does not accept on a message object.
+        for key in list(msg.keys()):
+            if key not in OPENAI_MESSAGE_KEYS:
+                logger.debug(f"Removing unsupported message field: {key}")
+                del msg[key]
+
+        role = msg.get("role")
+        content = msg.get("content")
+
+        # Only an assistant message carrying tool_calls may have null content.
+        if content is None and not (role == "assistant" and msg.get("tool_calls")):
+            msg["content"] = ""
+
+        # An assistant turn with neither text nor tool_calls is meaningless and is
+        # rejected by some backends; skip it entirely.
+        if role == "assistant" and not msg.get("tool_calls"):
+            body = msg.get("content")
+            if isinstance(body, str) and not body.strip():
+                continue
+
+        # A tool message with no id cannot be matched to a call.
+        if role == "tool" and not msg.get("tool_call_id"):
+            logger.warning("Dropping tool message with no tool_call_id")
+            continue
+
+        cleaned.append(msg)
+
+    # OpenAI requires at least one message.
+    if not cleaned:
+        cleaned = [{"role": "user", "content": "(empty request)"}]
+
+    # A trailing assistant message with unanswered tool_calls cannot be completed.
+    if cleaned[-1].get("role") == "assistant" and cleaned[-1].get("tool_calls"):
+        for call in cleaned[-1]["tool_calls"]:
+            cleaned.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "content": "(no result returned)",
+                }
+            )
+
+    litellm_request["messages"] = cleaned
+
+
+def _anthropic_msg_id(raw_id: Any) -> str:
+    """Anthropic ids start with msg_; some SDK paths assert on that prefix."""
+    if isinstance(raw_id, str) and raw_id.startswith("msg_"):
+        return raw_id
+    suffix = uuid.uuid4().hex[:24]
+    if isinstance(raw_id, str) and raw_id:
+        suffix = re.sub(r"[^A-Za-z0-9]", "", raw_id)[-24:] or suffix
+    return f"msg_{suffix}"
+
+
+def _extract_usage(usage_info: Any) -> tuple:
+    """Return (prompt_tokens, completion_tokens, cache_read_tokens).
+
+    Prompt-cache hits are reported by OpenAI under
+    prompt_tokens_details.cached_tokens; forwarding them lets Claude Code show
+    real cache savings instead of a flat zero.
+    """
+    def _get(obj, key, default=0):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    if usage_info is None:
+        return 0, 0, 0
+
+    prompt_tokens = _get(usage_info, "prompt_tokens", 0) or 0
+    completion_tokens = _get(usage_info, "completion_tokens", 0) or 0
+
+    cached = 0
+    details = _get(usage_info, "prompt_tokens_details", None)
+    if details is not None:
+        cached = _get(details, "cached_tokens", 0) or 0
+    if not cached:
+        cached = _get(usage_info, "cache_read_input_tokens", 0) or 0
+
+    # Anthropic counts cache reads separately from input_tokens; OpenAI includes
+    # them, so subtract to keep the totals consistent.
+    if cached and cached <= prompt_tokens:
+        prompt_tokens = prompt_tokens - cached
+
+    return prompt_tokens, completion_tokens, cached
+
+
+def map_finish_reason(finish_reason: Any, has_tool_use: bool = False) -> str:
+    """Map an OpenAI finish_reason onto an Anthropic stop_reason.
+
+    `has_tool_use` is not optional in practice. Many OpenAI-compatible backends
+    (LiteLLM, Ollama, vLLM, Gemini-via-compat, and OpenAI itself intermittently)
+    report finish_reason "stop" even when the response carries tool_calls. Passing
+    that through as "end_turn" tells the client the turn is over, so it delivers
+    the tool_use block but never executes it -- which Claude Code records as an
+    interrupted tool call. If we emitted a tool_use block, the turn is a tool turn,
+    whatever the backend called it.
+    """
+    mapping = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "max_tokens": "max_tokens",
+        "tool_calls": "tool_use",
+        "function_call": "tool_use",
+        "content_filter": "refusal",
+    }
+    reason = mapping.get(finish_reason, "end_turn")
+
+    if has_tool_use and reason not in ("max_tokens", "refusal"):
+        if reason != "tool_use":
+            logger.debug(
+                f"Overriding stop_reason {reason!r} -> 'tool_use' "
+                f"(backend reported finish_reason={finish_reason!r} with tool calls)"
+            )
+        return "tool_use"
+    return reason
 
 
 def convert_litellm_to_anthropic(
@@ -808,15 +1197,7 @@ def convert_litellm_to_anthropic(
 
     # Enhanced response extraction with better error handling
     try:
-        # Get the clean model name to check capabilities
-        clean_model = original_request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/") :]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/") :]
-
-        # Check if this is a Claude model (which supports content blocks)
-        is_claude_model = clean_model.startswith("claude-")
+        reasoning_text = None
 
         # Handle ModelResponse object from LiteLLM
         if hasattr(litellm_response, "choices") and hasattr(litellm_response, "usage"):
@@ -830,6 +1211,11 @@ def convert_litellm_to_anthropic(
                 message.tool_calls
                 if message and hasattr(message, "tool_calls")
                 else None
+            )
+            # Reasoning models expose their trace here; surface it as a thinking
+            # block instead of discarding it.
+            reasoning_text = getattr(message, "reasoning_content", None) or getattr(
+                message, "reasoning", None
             )
             finish_reason = (
                 choices[0].finish_reason if choices and len(choices) > 0 else "stop"
@@ -876,8 +1262,21 @@ def convert_litellm_to_anthropic(
             usage_info = response_dict.get("usage", {})
             response_id = response_dict.get("id", f"msg_{uuid.uuid4()}")
 
+        if reasoning_text is None and isinstance(message, dict):
+            reasoning_text = message.get("reasoning_content") or message.get("reasoning")
+
         # Create content list for Anthropic format
         content = []
+
+        # Thinking must precede text in an Anthropic content array.
+        if _should_emit_thinking(original_request) and reasoning_text:
+            content.append(
+                {
+                    "type": "thinking",
+                    "thinking": reasoning_text,
+                    "signature": "",
+                }
+            )
 
         # Add text content block if present (text might be None or empty for pure tool call responses)
         if content_text is not None and content_text != "":
@@ -933,37 +1332,46 @@ def convert_litellm_to_anthropic(
                 )
 
         # Get usage information - extract values safely from object or dict
-        if isinstance(usage_info, dict):
-            prompt_tokens = usage_info.get("prompt_tokens", 0)
-            completion_tokens = usage_info.get("completion_tokens", 0)
-        else:
-            prompt_tokens = getattr(usage_info, "prompt_tokens", 0)
-            completion_tokens = getattr(usage_info, "completion_tokens", 0)
+        prompt_tokens, completion_tokens, cache_read_tokens = _extract_usage(usage_info)
 
-        # Map OpenAI finish_reason to Anthropic stop_reason
-        stop_reason = None
-        if finish_reason == "stop":
-            stop_reason = "end_turn"
-        elif finish_reason == "length":
-            stop_reason = "max_tokens"
-        elif finish_reason == "tool_calls":
-            stop_reason = "tool_use"
-        else:
-            stop_reason = "end_turn"  # Default
+        stop_reason = map_finish_reason(
+            finish_reason,
+            has_tool_use=any(b.get("type") == "tool_use" for b in content),
+        )
+
+        # Anthropic reports which stop sequence fired; OpenAI does not, so detect it.
+        stop_sequence = None
+        if original_request.stop_sequences and content_text:
+            for seq in original_request.stop_sequences:
+                if seq and content_text.endswith(seq):
+                    stop_reason = "stop_sequence"
+                    stop_sequence = seq
+                    content_text = content_text[: -len(seq)]
+                    for blk in content:
+                        if blk.get("type") == "text":
+                            blk["text"] = content_text
+                    break
 
         # Make sure content is never empty
         if not content:
             content.append({"type": "text", "text": ""})
 
-        # Create Anthropic-style response
+        # Echo the model id the client asked for, not the internal mapped name.
+        # Claude Code compares this against what it sent.
+        response_model = original_request.original_model or original_request.model
+
         anthropic_response = MessagesResponse(
-            id=response_id,
-            model=original_request.model,
+            id=_anthropic_msg_id(response_id),
+            model=response_model,
             role="assistant",
             content=content,
             stop_reason=stop_reason,
-            stop_sequence=None,
-            usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
+            stop_sequence=stop_sequence,
+            usage=Usage(
+                input_tokens=prompt_tokens,
+                output_tokens=completion_tokens,
+                cache_read_input_tokens=cache_read_tokens,
+            ),
         )
 
         return anthropic_response
@@ -993,295 +1401,436 @@ def convert_litellm_to_anthropic(
         )
 
 
-async def handle_streaming(response_generator, original_request: MessagesRequest):
-    """Handle streaming responses from LiteLLM and convert to Anthropic format."""
-    try:
-        # Send message_start event
-        message_id = f"msg_{uuid.uuid4().hex[:24]}"  # Format similar to Anthropic's IDs
+def _sse(event_type: str, payload: Dict[str, Any]) -> str:
+    if DUMP_EVENTS:
+        logger.warning(f"SSE-> {event_type}: {json.dumps(payload, ensure_ascii=False)[:600]}")
+    return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-        message_data = {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": original_request.model,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "output_tokens": 0,
+
+class _BlockTracker:
+    """Tracks the open Anthropic content block while translating an OpenAI stream.
+
+    Anthropic requires that a text_delta only ever targets an open `text` block and
+    an input_json_delta only ever targets an open `tool_use` block, and that block
+    indices match their position in the final content array. The previous
+    implementation pinned text to index 0 forever, so any text emitted *after* a
+    tool call was dropped on the floor, and interleaved text/tool output produced
+    deltas aimed at the wrong block type (which the Anthropic SDK rejects with
+    "Content block is not a text block").
+    """
+
+    def __init__(self):
+        self.index = -1
+        self.open_type = None  # "text" | "tool_use" | "thinking"
+
+    def close(self):
+        if self.open_type is not None:
+            out = _sse("content_block_stop", {"type": "content_block_stop", "index": self.index})
+            self.open_type = None
+            return out
+        return ""
+
+    def open(self, block_type: str, block: Dict[str, Any]):
+        self.index += 1
+        self.open_type = block_type
+        return _sse(
+            "content_block_start",
+            {"type": "content_block_start", "index": self.index, "content_block": block},
+        )
+
+
+async def handle_streaming(response_generator, original_request: MessagesRequest):
+    """Translate an OpenAI-style stream into Anthropic SSE events."""
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    response_model = original_request.original_model or original_request.model
+
+    input_tokens = 0
+    output_tokens = 0
+    cache_read_tokens = 0
+    stop_reason = "end_turn"
+    stop_sequence = None
+    accumulated_text = ""
+
+    tracker = _BlockTracker()
+    # Per-upstream-tool-call state. A flat index->block map is not enough: some
+    # providers send the function name in a later chunk than the one that opens
+    # the call, and split arguments across many chunks. We therefore buffer each
+    # call and open its Anthropic block lazily, once the name is actually known.
+    tool_states: Dict[Any, Dict[str, Any]] = {}
+    # Text seen while a tool block is still awaiting the rest of its arguments.
+    pending_text = ""
+    emitted_stop = False
+
+    def _args_complete(buf: str) -> bool:
+        """True when a tool's accumulated argument JSON is syntactically whole."""
+        if not buf.strip():
+            return True
+        try:
+            json.loads(buf)
+            return True
+        except (json.JSONDecodeError, TypeError):
+            return False
+
+    def _open_tool_upstream_index():
+        """Which upstream tool call owns the currently open block, if any."""
+        if tracker.open_type != "tool_use":
+            return None
+        for key, st in tool_states.items():
+            if st.get("block_index") == tracker.index:
+                return key
+        return None
+
+    def _emit_text(txt: str):
+        out = []
+        if tracker.open_type != "text":
+            closed = tracker.close()
+            if closed:
+                out.append(closed)
+            out.append(tracker.open("text", {"type": "text", "text": ""}))
+        out.append(
+            _sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": tracker.index,
+                    "delta": {"type": "text_delta", "text": txt},
+                },
+            )
+        )
+        return out
+
+    def _open_tool_block(key):
+        """Open the Anthropic tool_use block and flush whatever args we buffered."""
+        st = tool_states[key]
+        out = []
+        closed = tracker.close()
+        if closed:
+            out.append(closed)
+        out.append(
+            tracker.open(
+                "tool_use",
+                {
+                    "type": "tool_use",
+                    "id": st["id"] or f"toolu_{uuid.uuid4().hex[:24]}",
+                    "name": st["name"] or "unknown",
+                    "input": {},
+                },
+            )
+        )
+        st["block_index"] = tracker.index
+        if st["args"]:
+            out.append(
+                _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": st["block_index"],
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": st["args"],
+                        },
+                    },
+                )
+            )
+            st["flushed"] = len(st["args"])
+        return out
+
+    try:
+        # message_start must carry input_tokens; sending 0 here made Claude Code's
+        # context/cost accounting read as zero for every streamed turn.
+        yield _sse(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": response_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": cache_read_tokens,
+                        "output_tokens": 0,
+                    },
                 },
             },
-        }
-        yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
+        )
+        yield _sse("ping", {"type": "ping"})
 
-        # Content block index for the first text block
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-
-        # Send a ping to keep the connection alive (Anthropic does this)
-        yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
-
-        tool_index = None
-        current_tool_call = None
-        tool_content = ""
-        accumulated_text = ""  # Track accumulated text content
-        text_sent = False  # Track if we've sent any text content
-        text_block_closed = False  # Track if text block is closed
-        input_tokens = 0
-        output_tokens = 0
-        has_sent_stop_reason = False
-        last_tool_index = 0
-
-        # Process each chunk
         async for chunk in response_generator:
             try:
-                # Check if this is the end of the response with usage data
-                if hasattr(chunk, "usage") and chunk.usage is not None:
-                    if hasattr(chunk.usage, "prompt_tokens"):
-                        input_tokens = chunk.usage.prompt_tokens
-                    if hasattr(chunk.usage, "completion_tokens"):
-                        output_tokens = chunk.usage.completion_tokens
+                # Usage can arrive on any chunk; with stream_options.include_usage
+                # it lands on a final chunk that has an empty choices array.
+                usage_obj = getattr(chunk, "usage", None)
+                if usage_obj is None and isinstance(chunk, dict):
+                    usage_obj = chunk.get("usage")
+                if usage_obj is not None:
+                    p, c, cached = _extract_usage(usage_obj)
+                    input_tokens = p or input_tokens
+                    output_tokens = c or output_tokens
+                    cache_read_tokens = cached or cache_read_tokens
 
-                # Handle text content
-                if hasattr(chunk, "choices") and len(chunk.choices) > 0:
-                    choice = chunk.choices[0]
+                choices = getattr(chunk, "choices", None)
+                if choices is None and isinstance(chunk, dict):
+                    choices = chunk.get("choices")
+                if not choices:
+                    continue
 
-                    # Get the delta from the choice
-                    if hasattr(choice, "delta"):
-                        delta = choice.delta
+                choice = choices[0]
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    delta = choice.get("delta") if isinstance(choice, dict) else None
+                if delta is None:
+                    delta = getattr(choice, "message", None) or {}
+
+                finish_reason = getattr(choice, "finish_reason", None)
+                if finish_reason is None and isinstance(choice, dict):
+                    finish_reason = choice.get("finish_reason")
+
+                # ---- reasoning trace ----
+                reasoning = _block_get(delta, "reasoning_content", None) or _block_get(
+                    delta, "reasoning", None
+                )
+                if _should_emit_thinking(original_request) and reasoning:
+                    if tracker.open_type != "thinking":
+                        closed = tracker.close()
+                        if closed:
+                            yield closed
+                        yield tracker.open(
+                            "thinking", {"type": "thinking", "thinking": "", "signature": ""}
+                        )
+                    yield _sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": tracker.index,
+                            "delta": {"type": "thinking_delta", "thinking": reasoning},
+                        },
+                    )
+
+                # ---- text ----
+                delta_content = _block_get(delta, "content", None)
+                if delta_content:
+                    open_tool_key = _open_tool_upstream_index()
+                    args_pending = (
+                        open_tool_key is not None
+                        and not _args_complete(tool_states[open_tool_key]["args"])
+                    )
+                    if args_pending:
+                        # A tool block is open and its argument JSON is still
+                        # incomplete. Closing it here to start a text block would
+                        # strand the remaining argument deltas on a closed block,
+                        # producing a truncated tool_use that the client reports as
+                        # an interrupted tool call. Whitespace here is just the
+                        # separator some backends emit between calls, so drop it;
+                        # real text is deferred until the call is complete.
+                        if delta_content.strip():
+                            pending_text += delta_content
                     else:
-                        # If no delta, try to get message
-                        delta = getattr(choice, "message", {})
-
-                    # Check for finish_reason to know when we're done
-                    finish_reason = getattr(choice, "finish_reason", None)
-
-                    # Process text content
-                    delta_content = None
-
-                    # Handle different formats of delta content
-                    if hasattr(delta, "content"):
-                        delta_content = delta.content
-                    elif isinstance(delta, dict) and "content" in delta:
-                        delta_content = delta["content"]
-
-                    # Accumulate text content
-                    if delta_content is not None and delta_content != "":
+                        if pending_text:
+                            for s in _emit_text(pending_text):
+                                yield s
+                            accumulated_text += pending_text
+                            pending_text = ""
+                        for s in _emit_text(delta_content):
+                            yield s
                         accumulated_text += delta_content
 
-                        # Always emit text deltas if no tool calls started
-                        if tool_index is None and not text_block_closed:
-                            text_sent = True
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
+                # ---- tool calls ----
+                delta_tool_calls = _block_get(delta, "tool_calls", None)
+                if delta_tool_calls:
+                    if not isinstance(delta_tool_calls, list):
+                        delta_tool_calls = [delta_tool_calls]
 
-                    # Process tool calls
-                    delta_tool_calls = None
+                    for tool_call in delta_tool_calls:
+                        upstream_index = _block_get(tool_call, "index", 0)
+                        if upstream_index is None:
+                            upstream_index = 0
+                        function = _block_get(tool_call, "function", None)
+                        name = _block_get(function, "name", None) if function else None
+                        arguments = (
+                            _block_get(function, "arguments", None) if function else None
+                        )
+                        call_id = _block_get(tool_call, "id", None)
 
-                    # Handle different formats of tool calls
-                    if hasattr(delta, "tool_calls"):
-                        delta_tool_calls = delta.tool_calls
-                    elif isinstance(delta, dict) and "tool_calls" in delta:
-                        delta_tool_calls = delta["tool_calls"]
+                        st = tool_states.setdefault(
+                            upstream_index,
+                            {"id": None, "name": None, "args": "", "block_index": None,
+                             "flushed": 0},
+                        )
+                        if call_id and not st["id"]:
+                            st["id"] = call_id
+                        # First non-empty name wins. Opening the block with an empty
+                        # name (as the previous version did whenever the provider
+                        # sent id and name in separate chunks) yields a nameless
+                        # tool_use that the client cannot execute.
+                        if name and not st["name"]:
+                            st["name"] = name
+                        if arguments:
+                            if isinstance(arguments, dict):
+                                arguments = json.dumps(arguments, ensure_ascii=False)
+                            st["args"] += arguments
 
-                    # Process tool calls if any
-                    if delta_tool_calls:
-                        # First tool call we've seen - need to handle text properly
-                        if tool_index is None:
-                            # If we've been streaming text, close that text block
-                            if text_sent and not text_block_closed:
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                            # If we've accumulated text but not sent it, we need to emit it now
-                            # This handles the case where the first delta has both text and a tool call
-                            elif (
-                                accumulated_text
-                                and not text_sent
-                                and not text_block_closed
+                        if st["block_index"] is None:
+                            # Wait for the name before opening the block.
+                            if st["name"]:
+                                for s in _open_tool_block(upstream_index):
+                                    yield s
+                        elif (
+                            tracker.open_type == "tool_use"
+                            and tracker.index == st["block_index"]
+                        ):
+                            unflushed = st["args"][st["flushed"] :]
+                            if unflushed:
+                                yield _sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": st["block_index"],
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": unflushed,
+                                        },
+                                    },
+                                )
+                                st["flushed"] = len(st["args"])
+                        else:
+                            # Its block was already closed; Anthropic blocks cannot
+                            # be reopened. Keep buffering so nothing is lost, and
+                            # warn because this means a backend interleaved output
+                            # in a way we could not represent.
+                            logger.warning(
+                                f"Late arguments for closed tool block "
+                                f"{st['id']!r}; {len(st['args']) - st['flushed']} "
+                                f"chars could not be streamed"
+                            )
+
+                # ---- completion ----
+                if finish_reason and not emitted_stop:
+                    emitted_stop = True
+                    stop_reason = map_finish_reason(
+                        finish_reason, has_tool_use=bool(tool_states)
+                    )
+
+                    # A tool whose name never arrived was never opened; emit it now
+                    # rather than dropping the call entirely.
+                    for key, st in tool_states.items():
+                        if st["block_index"] is None:
+                            if st["id"] or st["args"] or st["name"]:
+                                for s in _open_tool_block(key):
+                                    yield s
+                        elif st["flushed"] < len(st["args"]):
+                            if (
+                                tracker.open_type == "tool_use"
+                                and tracker.index == st["block_index"]
                             ):
-                                # Send the accumulated text
-                                text_sent = True
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                                # Close the text block
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                            # Close text block even if we haven't sent anything - models sometimes emit empty text blocks
-                            elif not text_block_closed:
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-
-                        # Convert to list if it's not already
-                        if not isinstance(delta_tool_calls, list):
-                            delta_tool_calls = [delta_tool_calls]
-
-                        for tool_call in delta_tool_calls:
-                            # Get the index of this tool call (for multiple tools)
-                            current_index = None
-                            if isinstance(tool_call, dict) and "index" in tool_call:
-                                current_index = tool_call["index"]
-                            elif hasattr(tool_call, "index"):
-                                current_index = tool_call.index
-                            else:
-                                current_index = 0
-
-                            # Check if this is a new tool or a continuation
-                            if tool_index is None or current_index != tool_index:
-                                # New tool call - create a new tool_use block
-                                tool_index = current_index
-                                last_tool_index += 1
-                                anthropic_tool_index = last_tool_index
-
-                                # Extract function info
-                                if isinstance(tool_call, dict):
-                                    function = tool_call.get("function", {})
-                                    name = (
-                                        function.get("name", "")
-                                        if isinstance(function, dict)
-                                        else ""
-                                    )
-                                    tool_id = tool_call.get(
-                                        "id", f"toolu_{uuid.uuid4().hex[:24]}"
-                                    )
-                                else:
-                                    function = getattr(tool_call, "function", None)
-                                    name = (
-                                        getattr(function, "name", "")
-                                        if function
-                                        else ""
-                                    )
-                                    tool_id = getattr(
-                                        tool_call,
-                                        "id",
-                                        f"toolu_{uuid.uuid4().hex[:24]}",
-                                    )
-
-                                # Start a new tool_use block
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
-                                current_tool_call = tool_call
-                                tool_content = ""
-
-                            # Extract function arguments
-                            arguments = None
-                            if isinstance(tool_call, dict) and "function" in tool_call:
-                                function = tool_call.get("function", {})
-                                arguments = (
-                                    function.get("arguments", "")
-                                    if isinstance(function, dict)
-                                    else ""
+                                yield _sse(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": st["block_index"],
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": st["args"][st["flushed"] :],
+                                        },
+                                    },
                                 )
-                            elif hasattr(tool_call, "function"):
-                                function = getattr(tool_call, "function", None)
-                                arguments = (
-                                    getattr(function, "arguments", "")
-                                    if function
-                                    else ""
-                                )
+                                st["flushed"] = len(st["args"])
 
-                            # If we have arguments, send them as a delta
-                            if arguments:
-                                # Try to detect if arguments are valid JSON or just a fragment
-                                try:
-                                    # If it's already a dict, use it
-                                    if isinstance(arguments, dict):
-                                        args_json = json.dumps(arguments)
-                                    else:
-                                        # Otherwise, try to parse it
-                                        json.loads(arguments)
-                                        args_json = arguments
-                                except (json.JSONDecodeError, TypeError):
-                                    # If it's a fragment, treat it as a string
-                                    args_json = arguments
+                    # Text deferred while a tool call was still assembling.
+                    if pending_text:
+                        for s in _emit_text(pending_text):
+                            yield s
+                        accumulated_text += pending_text
+                        pending_text = ""
 
-                                # Add to accumulated tool content
-                                tool_content += (
-                                    args_json if isinstance(args_json, str) else ""
-                                )
+                    if original_request.stop_sequences and accumulated_text:
+                        for seq in original_request.stop_sequences:
+                            if seq and accumulated_text.endswith(seq):
+                                stop_reason = "stop_sequence"
+                                stop_sequence = seq
+                                break
 
-                                # Send the update
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
+                    closed = tracker.close()
+                    if closed:
+                        yield closed
+                    # Do not return here: the usage-bearing chunk from
+                    # stream_options.include_usage arrives *after* finish_reason.
 
-                    # Process finish_reason - end the streaming response
-                    if finish_reason and not has_sent_stop_reason:
-                        has_sent_stop_reason = True
-
-                        # Close any open tool call blocks
-                        if tool_index is not None:
-                            for i in range(1, last_tool_index + 1):
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
-
-                        # If we accumulated text but never sent or closed text block, do it now
-                        if not text_block_closed:
-                            if accumulated_text and not text_sent:
-                                # Send the accumulated text
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                            # Close the text block
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-
-                        # Map OpenAI finish_reason to Anthropic stop_reason
-                        stop_reason = "end_turn"
-                        if finish_reason == "length":
-                            stop_reason = "max_tokens"
-                        elif finish_reason == "tool_calls":
-                            stop_reason = "tool_use"
-                        elif finish_reason == "stop":
-                            stop_reason = "end_turn"
-
-                        # Send message_delta with stop reason and usage
-                        usage = {"output_tokens": output_tokens}
-
-                        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
-
-                        # Send message_stop event
-                        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-                        # Send final [DONE] marker to match Anthropic's behavior
-                        yield "data: [DONE]\n\n"
-                        return
-            except Exception as e:
-                # Log error but continue processing other chunks
-                logger.error(f"Error processing chunk: {str(e)}")
+            except Exception as chunk_error:
+                logger.error(f"Error processing chunk: {chunk_error}")
                 continue
 
-        # If we didn't get a finish reason, close any open blocks
-        if not has_sent_stop_reason:
-            # Close any open tool call blocks
-            if tool_index is not None:
-                for i in range(1, last_tool_index + 1):
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
+        # Anthropic requires at least one content block in the message.
+        if tracker.index == -1:
+            yield tracker.open("text", {"type": "text", "text": ""})
+            closed = tracker.close()
+            if closed:
+                yield closed
+        else:
+            closed = tracker.close()
+            if closed:
+                yield closed
 
-            # Close the text content block
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+        # Some backends end the stream without ever sending a finish_reason. If we
+        # emitted tool calls, the turn is still a tool turn.
+        if not emitted_stop and tool_states and stop_reason == "end_turn":
+            stop_reason = "tool_use"
 
-            # Send final message_delta with usage
-            usage = {"output_tokens": output_tokens}
+        # Truncated argument JSON means the client cannot run the call; surfacing
+        # max_tokens is more accurate (and more debuggable) than a clean tool_use.
+        for st in tool_states.values():
+            if st["args"] and not _args_complete(st["args"]):
+                logger.warning(
+                    f"Tool {st['name']!r} has incomplete argument JSON "
+                    f"({len(st['args'])} chars); the call will not be runnable"
+                )
+                if stop_reason == "tool_use":
+                    stop_reason = "max_tokens"
 
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
-
-            # Send message_stop event
-            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-            # Send final [DONE] marker to match Anthropic's behavior
-            yield "data: [DONE]\n\n"
+        yield _sse(
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read_tokens,
+                    "output_tokens": output_tokens,
+                },
+            },
+        )
+        yield _sse("message_stop", {"type": "message_stop"})
+        yield "data: [DONE]\n\n"
 
     except Exception as e:
         import traceback
 
-        error_traceback = traceback.format_exc()
-        error_message = (
-            f"Error in streaming: {str(e)}\n\nFull traceback:\n{error_traceback}"
+        logger.error(f"Error in streaming: {e}\n{traceback.format_exc()}")
+
+        # Close whatever is open so the client's parser is not left mid-block.
+        try:
+            closed = tracker.close()
+            if closed:
+                yield closed
+        except Exception:
+            pass
+
+        # Anthropic signals mid-stream failure with an `error` event; the previous
+        # code sent stop_reason:"error", which is not a valid Anthropic stop_reason
+        # and made SDKs report a malformed response instead of the real cause.
+        yield _sse(
+            "error",
+            {
+                "type": "error",
+                "error": {"type": "api_error", "message": str(e)},
+            },
         )
-        logger.error(error_message)
-
-        # Send error message_delta
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
-
-        # Send message_stop event
-        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-        # Send final [DONE] marker
+        yield _sse("message_stop", {"type": "message_stop"})
         yield "data: [DONE]\n\n"
 
 
@@ -1340,194 +1889,22 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             litellm_request["api_key"] = ANTHROPIC_API_KEY
             logger.debug(f"Using Anthropic API key for model: {request.model}")
 
-        # For OpenAI models - modify request format to work with limitations
-        if "openai" in litellm_request["model"] and "messages" in litellm_request:
-            logger.debug(f"Processing OpenAI model request: {litellm_request['model']}")
+        # NOTE: the legacy "flatten every content block into a string" pass that
+        # used to live here has been removed. convert_anthropic_to_litellm() now
+        # emits proper OpenAI messages (tool_calls / role:"tool" / image_url), and
+        # re-flattening them here would have thrown that structure away again.
+        _validate_openai_messages(litellm_request)
 
-            # For OpenAI models, we need to convert content blocks to simple strings
-            # and handle other requirements
-            for i, msg in enumerate(litellm_request["messages"]):
-                # Special case - handle message content directly when it's a list of tool_result
-                # This is a specific case we're seeing in the error
-                if "content" in msg and isinstance(msg["content"], list):
-                    is_only_tool_result = True
-                    for block in msg["content"]:
-                        if (
-                            not isinstance(block, dict)
-                            or block.get("type") != "tool_result"
-                        ):
-                            is_only_tool_result = False
-                            break
-
-                    if is_only_tool_result and len(msg["content"]) > 0:
-                        logger.warning(
-                            f"Found message with only tool_result content - special handling required"
-                        )
-                        # Extract the content from all tool_result blocks
-                        all_text = ""
-                        for block in msg["content"]:
-                            all_text += "Tool Result:\n"
-                            result_content = block.get("content", [])
-
-                            # Handle different formats of content
-                            if isinstance(result_content, list):
-                                for item in result_content:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("type") == "text"
-                                    ):
-                                        all_text += item.get("text", "") + "\n"
-                                    elif isinstance(item, dict):
-                                        # Fall back to string representation of any dict
-                                        try:
-                                            item_text = item.get(
-                                                "text", json.dumps(item)
-                                            )
-                                            all_text += item_text + "\n"
-                                        except:
-                                            all_text += str(item) + "\n"
-                            elif isinstance(result_content, str):
-                                all_text += result_content + "\n"
-                            else:
-                                try:
-                                    all_text += json.dumps(result_content) + "\n"
-                                except:
-                                    all_text += str(result_content) + "\n"
-
-                        # Replace the list with extracted text
-                        litellm_request["messages"][i]["content"] = (
-                            all_text.strip() or "..."
-                        )
-                        logger.warning(
-                            f"Converted tool_result to plain text: {all_text.strip()[:200]}..."
-                        )
-                        continue  # Skip normal processing for this message
-
-                # 1. Handle content field - normal case
-                if "content" in msg:
-                    # Check if content is a list (content blocks)
-                    if isinstance(msg["content"], list):
-                        # Convert complex content blocks to simple string
-                        text_content = ""
-                        for block in msg["content"]:
-                            if isinstance(block, dict):
-                                # Handle different content block types
-                                if block.get("type") == "text":
-                                    text_content += block.get("text", "") + "\n"
-
-                                # Handle tool_result content blocks - extract nested text
-                                elif block.get("type") == "tool_result":
-                                    tool_id = block.get("tool_use_id", "unknown")
-                                    text_content += f"[Tool Result ID: {tool_id}]\n"
-
-                                    # Extract text from the tool_result content
-                                    result_content = block.get("content", [])
-                                    if isinstance(result_content, list):
-                                        for item in result_content:
-                                            if (
-                                                isinstance(item, dict)
-                                                and item.get("type") == "text"
-                                            ):
-                                                text_content += (
-                                                    item.get("text", "") + "\n"
-                                                )
-                                            elif isinstance(item, dict):
-                                                # Handle any dict by trying to extract text or convert to JSON
-                                                if "text" in item:
-                                                    text_content += (
-                                                        item.get("text", "") + "\n"
-                                                    )
-                                                else:
-                                                    try:
-                                                        text_content += (
-                                                            json.dumps(item) + "\n"
-                                                        )
-                                                    except:
-                                                        text_content += str(item) + "\n"
-                                    elif isinstance(result_content, dict):
-                                        # Handle dictionary content
-                                        if result_content.get("type") == "text":
-                                            text_content += (
-                                                result_content.get("text", "") + "\n"
-                                            )
-                                        else:
-                                            try:
-                                                text_content += (
-                                                    json.dumps(result_content) + "\n"
-                                                )
-                                            except:
-                                                text_content += (
-                                                    str(result_content) + "\n"
-                                                )
-                                    elif isinstance(result_content, str):
-                                        text_content += result_content + "\n"
-                                    else:
-                                        try:
-                                            text_content += (
-                                                json.dumps(result_content) + "\n"
-                                            )
-                                        except:
-                                            text_content += str(result_content) + "\n"
-
-                                # Handle tool_use content blocks
-                                elif block.get("type") == "tool_use":
-                                    tool_name = block.get("name", "unknown")
-                                    tool_id = block.get("id", "unknown")
-                                    tool_input = json.dumps(block.get("input", {}))
-                                    text_content += f"[Tool: {tool_name} (ID: {tool_id})]\nInput: {tool_input}\n\n"
-
-                                # Handle image content blocks
-                                elif block.get("type") == "image":
-                                    text_content += "[Image content - not displayed in text format]\n"
-
-                        # Make sure content is never empty for OpenAI models
-                        if not text_content.strip():
-                            text_content = "..."
-
-                        litellm_request["messages"][i]["content"] = text_content.strip()
-                    # Also check for None or empty string content
-                    elif msg["content"] is None:
-                        litellm_request["messages"][i]["content"] = (
-                            "..."  # Empty content not allowed
-                        )
-
-                # 2. Remove any fields OpenAI doesn't support in messages
-                for key in list(msg.keys()):
-                    if key not in [
-                        "role",
-                        "content",
-                        "name",
-                        "tool_call_id",
-                        "tool_calls",
-                    ]:
-                        logger.warning(
-                            f"Removing unsupported field from message: {key}"
-                        )
-                        del msg[key]
-
-            # 3. Final validation - check for any remaining invalid values and dump full message details
-            for i, msg in enumerate(litellm_request["messages"]):
-                # Log the message format for debugging
-                logger.debug(
-                    f"Message {i} format check - role: {msg.get('role')}, content type: {type(msg.get('content'))}"
-                )
-
-                # If content is still a list or None, replace with placeholder
-                if isinstance(msg.get("content"), list):
-                    logger.warning(
-                        f"CRITICAL: Message {i} still has list content after processing: {json.dumps(msg.get('content'))}"
-                    )
-                    # Last resort - stringify the entire content as JSON
-                    litellm_request["messages"][i]["content"] = (
-                        f"Content as JSON: {json.dumps(msg.get('content'))}"
-                    )
-                elif msg.get("content") is None:
-                    logger.warning(
-                        f"Message {i} has None content - replacing with placeholder"
-                    )
-                    litellm_request["messages"][i]["content"] = (
-                        "..."  # Fallback placeholder
-                    )
+        if DUMP_EVENTS:
+            _dump = {
+                k: v for k, v in litellm_request.items()
+                if k not in ("api_key", "messages", "tools", "extra_headers")
+            }
+            _dump["message_roles"] = [m.get("role") for m in litellm_request["messages"]]
+            _dump["tool_names"] = [
+                t["function"]["name"] for t in litellm_request.get("tools", [])
+            ]
+            logger.warning(f"UPSTREAM-> {json.dumps(_dump, ensure_ascii=False)[:1500]}")
 
         # Only log basic info about the request, not the full details
         logger.debug(
@@ -1548,7 +1925,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 litellm_request.get("model"),
                 len(litellm_request["messages"]),
                 num_tools,
-                200,  # Assuming success at this point
+                None,  # in-flight; real status is logged on failure
             )
             # Ensure we use the async version for streaming
             response_generator = await litellm.acompletion(**litellm_request)
@@ -1556,6 +1933,11 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             return StreamingResponse(
                 handle_streaming(response_generator, request),
                 media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
             )
         else:
             # Use LiteLLM for regular completion
@@ -1568,10 +1950,12 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 litellm_request.get("model"),
                 len(litellm_request["messages"]),
                 num_tools,
-                200,  # Assuming success at this point
+                None,  # in-flight; real status is logged on failure
             )
             start_time = time.time()
-            litellm_response = litellm.completion(**litellm_request)
+            # acompletion, not completion: the sync client blocks the event loop for
+            # the whole generation, so one slow request stalled every other client.
+            litellm_response = await litellm.acompletion(**litellm_request)
             logger.debug(
                 f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s"
             )
@@ -1629,15 +2013,39 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         )
 
         # Format error for response
-        error_message = f"Error: {str(e)}"
-        if "message" in error_details and error_details["message"]:
-            error_message += f"\nMessage: {error_details['message']}"
-        if "response" in error_details and error_details["response"]:
-            error_message += f"\nResponse: {error_details['response']}"
+        error_message = str(e)
+        if error_details.get("message"):
+            error_message = str(error_details["message"])
 
-        # Return detailed error
         status_code = error_details.get("status_code", 500)
-        raise HTTPException(status_code=status_code, detail=error_message)
+        try:
+            status_code = int(status_code)
+        except (TypeError, ValueError):
+            status_code = 500
+
+        log_request_beautifully(
+            "POST",
+            raw_request.url.path,
+            request.original_model or request.model,
+            request.model,
+            len(request.messages),
+            len(request.tools) if request.tools else 0,
+            status_code,
+        )
+
+        # Anthropic clients parse {"type":"error","error":{...}}. FastAPI's default
+        # {"detail": ...} envelope made every upstream failure surface in Claude Code
+        # as an opaque "API Error" with no message.
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "type": "error",
+                "error": {
+                    "type": _anthropic_error_type(status_code),
+                    "message": error_message,
+                },
+            },
+        )
 
 
 @app.post("/v1/messages/count_tokens")
@@ -1686,7 +2094,7 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
                 converted_request.get("model"),
                 len(converted_request["messages"]),
                 num_tools,
-                200,  # Assuming success at this point
+                None,  # in-flight; real status is logged on failure
             )
 
             # Prepare token counter arguments
@@ -1699,16 +2107,32 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
             if request.model.startswith("openai/") and OPENAI_BASE_URL:
                 token_counter_args["api_base"] = OPENAI_BASE_URL
 
-            # Count tokens
             token_count = token_counter(**token_counter_args)
 
-            # Return Anthropic-style response
+            # Tool definitions are part of the billed prompt but token_counter
+            # ignores them. Claude Code uses this endpoint to decide when to
+            # compact, so undercounting the whole toolset by thousands of tokens
+            # made it compact far too late and overflow the real context window.
+            tools = converted_request.get("tools") or []
+            if tools:
+                try:
+                    tools_text = json.dumps(tools, ensure_ascii=False)
+                    token_count += token_counter(
+                        model=converted_request["model"],
+                        text=tools_text,
+                    )
+                except Exception as tool_err:
+                    logger.debug(f"Tool token estimate failed: {tool_err}")
+                    token_count += len(json.dumps(tools)) // 4
+
             return TokenCountResponse(input_tokens=token_count)
 
         except ImportError:
             logger.error("Could not import token_counter from litellm")
-            # Fallback to a simple approximation
-            return TokenCountResponse(input_tokens=1000)  # Default fallback
+            # ~4 chars per token is far closer than a flat 1000, which reported the
+            # same count for a one-line prompt and a 100k-token conversation.
+            approx = len(json.dumps(converted_request.get("messages", []))) // 4
+            return TokenCountResponse(input_tokens=max(approx, 1))
 
     except Exception as e:
         import traceback
@@ -1716,6 +2140,93 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         error_traceback = traceback.format_exc()
         logger.error(f"Error counting tokens: {str(e)}\n{error_traceback}")
         raise HTTPException(status_code=500, detail=f"Error counting tokens: {str(e)}")
+
+
+def _anthropic_error_type(status_code: int) -> str:
+    """Map an HTTP status onto Anthropic's error `type` vocabulary."""
+    return {
+        400: "invalid_request_error",
+        401: "authentication_error",
+        403: "permission_error",
+        404: "not_found_error",
+        413: "request_too_large",
+        422: "invalid_request_error",
+        429: "rate_limit_error",
+        500: "api_error",
+        529: "overloaded_error",
+    }.get(status_code, "api_error")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Report malformed requests in Anthropic's error envelope.
+
+    A 422 with FastAPI's default body is unparseable to the Anthropic SDK, so a
+    schema mismatch used to look like a network fault to the client.
+    """
+    logger.warning(f"Request validation failed: {exc.errors()}")
+    return JSONResponse(
+        status_code=400,
+        content={
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": f"Invalid request: {exc.errors()}",
+            },
+        },
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "type": "error",
+            "error": {
+                "type": _anthropic_error_type(exc.status_code),
+                "message": str(exc.detail),
+            },
+        },
+    )
+
+
+@app.get("/health")
+async def health():
+    """Liveness probe plus the effective model mapping, for debugging setups."""
+    return {
+        "status": "ok",
+        "preferred_provider": PREFERRED_PROVIDER,
+        "big_model": BIG_MODEL,
+        "middle_model": MIDDLE_MODEL,
+        "small_model": SMALL_MODEL,
+        "openai_base_url": OPENAI_BASE_URL or "default",
+        "api_key_configured": bool(OPENAI_API_KEY or ANTHROPIC_API_KEY or GEMINI_API_KEY),
+    }
+
+
+@app.get("/v1/models")
+async def list_models():
+    """Minimal Anthropic-style model list; some clients probe this on startup."""
+    known = [
+        "claude-3-5-haiku-20241022",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-7-sonnet-20250219",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514",
+    ]
+    return {
+        "data": [
+            {
+                "id": m,
+                "type": "model",
+                "display_name": m,
+                "created_at": "2025-01-01T00:00:00Z",
+            }
+            for m in known
+        ],
+        "has_more": False,
+    }
 
 
 @app.get("/")
@@ -1759,12 +2270,15 @@ def log_request_beautifully(
     tools_str = f"{Colors.MAGENTA}{num_tools} tools{Colors.RESET}"
     messages_str = f"{Colors.BLUE}{num_messages} messages{Colors.RESET}"
 
-    # Format status code
-    status_str = (
-        f"{Colors.GREEN}✓ {status_code} OK{Colors.RESET}"
-        if status_code == 200
-        else f"{Colors.RED}✗ {status_code}{Colors.RESET}"
-    )
+    # Format status code. `None` means the upstream call has not returned yet, so
+    # do not claim success: the old code hardcoded 200 before the request was even
+    # made, which printed a green "✓ 200 OK" for requests that then failed.
+    if status_code is None:
+        status_str = f"{Colors.DIM}… in flight{Colors.RESET}"
+    elif status_code == 200:
+        status_str = f"{Colors.GREEN}✓ {status_code} OK{Colors.RESET}"
+    else:
+        status_str = f"{Colors.RED}✗ {status_code}{Colors.RESET}"
 
     # Put it all together in a clear, beautiful format
     log_line = f"{Colors.BOLD}{method} {endpoint}{Colors.RESET} {status_str}"

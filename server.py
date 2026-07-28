@@ -10,6 +10,8 @@ import os
 from fastapi.responses import JSONResponse, StreamingResponse
 import litellm
 import uuid
+import base64
+import asyncio
 import time
 from dotenv import load_dotenv
 import re
@@ -61,6 +63,17 @@ def get_custom_headers_from_env() -> Dict[str, str]:
 
 # Pre-compute custom headers at startup for efficiency
 CUSTOM_HEADERS = get_custom_headers_from_env()
+
+# Headers that must never be overwritten on an outgoing response. Replacing
+# content-type on a StreamingResponse breaks SSE parsing outright; the rest are
+# hop-by-hop or framing headers owned by the server.
+RESPONSE_PROTECTED_HEADERS = {
+    "content-type",
+    "content-length",
+    "transfer-encoding",
+    "content-encoding",
+    "connection",
+}
 
 import re
 
@@ -128,6 +141,20 @@ class MessageFilter(logging.Filter):
 # Apply the filter to the root logger to catch all messages
 root_logger = logging.getLogger()
 root_logger.addFilter(MessageFilter())
+
+# LiteLLM emits a large traceback for every request when it cannot price the
+# model (any model not in its cost map, e.g. a self-hosted or gateway model).
+# It is harmless post-response noise, but at DEBUG it buries the proxy's own
+# output. Keep LiteLLM's internal logger quiet unless LITELLM_LOG_LEVEL says
+# otherwise, so LOG_LEVEL=DEBUG shows *our* diagnostics.
+litellm.suppress_debug_info = True
+logging.getLogger("LiteLLM").setLevel(
+    getattr(logging, os.environ.get("LITELLM_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+)
+for _n in ("litellm", "LiteLLM Proxy", "LiteLLM Router"):
+    logging.getLogger(_n).setLevel(
+        getattr(logging, os.environ.get("LITELLM_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+    )
 
 
 # Custom formatter for model mapping logs
@@ -241,6 +268,38 @@ DISABLE_STREAM_OPTIONS = (
 # outgoing upstream payload. This is the fastest way to see what a client is
 # actually receiving when a turn ends unexpectedly.
 DUMP_EVENTS = os.environ.get("DUMP_EVENTS", "false").lower() == "true"
+
+# Seconds of silence before the proxy emits a keep-alive ping mid-stream. Tool
+# calls are buffered until the stream ends, so a large Edit/Write payload can
+# otherwise produce tens of seconds with no SSE traffic at all, and clients drop
+# the connection. Anthropic's protocol allows ping events anywhere in a stream.
+# Set to 0 to disable.
+STREAM_KEEPALIVE_SECONDS = float(os.environ.get("STREAM_KEEPALIVE_SECONDS", "3"))
+
+# Abort if the upstream sends no data for this long. A gateway returning 200 and
+# then never streaming a body used to hang the request forever with nothing in
+# the log after the response headers. 0 disables.
+UPSTREAM_IDLE_TIMEOUT = float(os.environ.get("UPSTREAM_IDLE_TIMEOUT", "90"))
+
+# COMPAT_MODE=true drops every request field this proxy added over the older,
+# known-working shape: no stream_options, no `user`, and max_tokens capped at
+# 16384. Strict or older OpenAI-compatible gateways (one-api / new-api forks and
+# similar) can accept a request carrying unknown fields with 200 and then never
+# stream a body. This keeps all the response-side and tool-handling fixes while
+# sending exactly what the pre-patch proxy sent.
+COMPAT_MODE = os.environ.get("COMPAT_MODE", "false").lower() == "true"
+
+# Report an empty assistant turn as an error rather than letting it look like a
+# normal finish. An empty completion silently ends the agent loop.
+ERROR_ON_EMPTY_RESPONSE = (
+    os.environ.get("ERROR_ON_EMPTY_RESPONSE", "true").lower() == "true"
+)
+
+# Placeholder signature attached to synthesized thinking blocks. Real Anthropic
+# signatures are cryptographic and cannot be produced for a third-party backend;
+# this value only has to be non-empty and stable, since the proxy strips thinking
+# blocks out of conversation history before forwarding them upstream.
+PROXY_THINKING_SIGNATURE = base64.b64encode(b"litellm-proxy-unsigned-thinking").decode()
 
 
 def _should_emit_thinking(original_request) -> bool:
@@ -560,11 +619,23 @@ class MessagesResponse(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     if CUSTOM_HEADERS:
-        logger.warning(f"Injecting {len(CUSTOM_HEADERS)} custom header(s) on every response:")
-        for name, value in CUSTOM_HEADERS.items():
-            # Mask values that look like secrets
-            display_value = value if len(value) < 20 else value[:6] + "..." 
+        upstream_only = [
+            n for n in CUSTOM_HEADERS if n.lower() in RESPONSE_PROTECTED_HEADERS
+        ]
+        applied = [n for n in CUSTOM_HEADERS if n.lower() not in RESPONSE_PROTECTED_HEADERS]
+        logger.warning(
+            f"Custom headers: {len(applied)} sent upstream and echoed on responses, "
+            f"{len(upstream_only)} sent upstream only"
+        )
+        for name in applied:
+            value = CUSTOM_HEADERS[name]
+            display_value = value if len(value) < 20 else value[:6] + "..."
             logger.warning(f"  {name}: {display_value}")
+        for name in upstream_only:
+            logger.warning(
+                f"  {name}: {CUSTOM_HEADERS[name]}  [upstream only - overriding this "
+                f"on responses would break SSE streaming]"
+            )
     else:
         logger.debug("No CUSTOM_HEADER_* environment variables found.")
 
@@ -576,8 +647,16 @@ async def log_requests(request: Request, call_next):
 
     response = await call_next(request)
 
-    # Inject custom headers from environment variables
+    # Inject custom headers from environment variables.
+    #
+    # Protocol headers are never overridden. CUSTOM_HEADER_CONTENT_TYPE is meant
+    # for the *upstream* request (where application/json is correct), but applying
+    # it to the response replaces text/event-stream on streamed replies, so the
+    # client stops treating the body as SSE, waits for a complete JSON document
+    # that never comes, and silently ends the turn.
     for header_name, header_value in CUSTOM_HEADERS.items():
+        if header_name.lower() in RESPONSE_PROTECTED_HEADERS:
+            continue
         response.headers[header_name] = header_value
 
     return response
@@ -890,6 +969,10 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     max_tokens = anthropic_request.max_tokens
     if MAX_TOKENS_LIMIT:
         max_tokens = min(max_tokens, MAX_TOKENS_LIMIT)
+    elif COMPAT_MODE and not target_model.startswith("anthropic/"):
+        # The pre-patch proxy hardcoded this cap; some gateways reject or stall on
+        # larger values than the backing model advertises.
+        max_tokens = min(max_tokens, 16384)
 
     litellm_request: Dict[str, Any] = {
         "model": target_model,
@@ -941,11 +1024,15 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     # output_tokens: 0 for every streamed reply and Claude Code's context meter
     # never moved. Some third-party gateways reject the unknown field, so it can
     # be turned off with DISABLE_STREAM_OPTIONS=true.
-    if anthropic_request.stream and not DISABLE_STREAM_OPTIONS:
+    if anthropic_request.stream and not (DISABLE_STREAM_OPTIONS or COMPAT_MODE):
         litellm_request["stream_options"] = {"include_usage": True}
 
     # metadata.user_id -> `user` (abuse-tracking / caching hints)
-    if anthropic_request.metadata and isinstance(anthropic_request.metadata, dict):
+    if (
+        anthropic_request.metadata
+        and isinstance(anthropic_request.metadata, dict)
+        and not COMPAT_MODE
+    ):
         user_id = anthropic_request.metadata.get("user_id")
         if isinstance(user_id, str) and user_id:
             litellm_request["user"] = user_id[:128]
@@ -1274,7 +1361,7 @@ def convert_litellm_to_anthropic(
                 {
                     "type": "thinking",
                     "thinking": reasoning_text,
-                    "signature": "",
+                    "signature": PROXY_THINKING_SIGNATURE,
                 }
             )
 
@@ -1325,7 +1412,7 @@ def convert_litellm_to_anthropic(
                 content.append(
                     {
                         "type": "tool_use",
-                        "id": tool_id,
+                        "id": _client_tool_id(tool_id, name),
                         "name": name,
                         "input": arguments,
                     }
@@ -1401,6 +1488,133 @@ def convert_litellm_to_anthropic(
         )
 
 
+def _repair_truncated_json(buf: str) -> Optional[str]:
+    """Best-effort completion of argument JSON that was cut off mid-value.
+
+    A truncated tool argument is unrunnable, and reporting it as max_tokens halts
+    the agent loop entirely. Closing the open strings/brackets at least yields a
+    runnable call the model can correct on the next turn.
+    """
+    if not buf.strip():
+        return "{}"
+    stack = []
+    in_string = False
+    escaped = False
+    for ch in buf:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+
+    candidate = buf
+    if escaped:
+        candidate = candidate[:-1]
+    if in_string:
+        candidate += '"'
+    # A dangling key with no value ("foo": ) cannot be closed meaningfully.
+    stripped = candidate.rstrip()
+    if stripped.endswith(":"):
+        candidate = stripped + "null"
+    elif stripped.endswith(","):
+        candidate = stripped[:-1]
+    candidate += "".join(reversed(stack))
+
+    try:
+        json.loads(candidate)
+        return candidate
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+async def _iter_with_idle_timeout(generator, timeout: float):
+    """Yield from an upstream stream, failing loudly if it goes silent.
+
+    A gateway can return 200 with `content-type: text/event-stream` and then never
+    send a body chunk. Awaiting that forever leaves the proxy hung with nothing in
+    the log after the response headers, which is indistinguishable from a proxy
+    bug. Time-boxing each read turns it into a reportable error.
+    """
+    iterator = generator.__aiter__()
+    first = True
+    while True:
+        try:
+            if timeout and timeout > 0:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+            else:
+                chunk = await iterator.__anext__()
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                f"Upstream sent no data for {timeout:g}s after "
+                + ("the response headers" if first else "the previous chunk")
+                + ". The backend accepted the request but is not streaming; check "
+                "the gateway, or try DISABLE_STREAM_OPTIONS=true and a lower "
+                "MAX_TOKENS_LIMIT."
+            )
+        if first:
+            first = False
+            logger.debug("First upstream chunk received")
+        yield chunk
+
+
+# Characters Anthropic tool_use ids never contain. An id outside this set is
+# certainly synthesized by the backend rather than a random handle.
+_PLAIN_TOOL_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+
+PRESERVE_UPSTREAM_TOOL_IDS = (
+    os.environ.get("PRESERVE_UPSTREAM_TOOL_IDS", "false").lower() == "true"
+)
+
+
+def _client_tool_id(upstream_id: Any, tool_name: Any = None) -> str:
+    """Return a tool_use id that is unique across the whole conversation.
+
+    Some backends derive the id from the tool name and its position, e.g. Kimi
+    emits "Edit:0". Those repeat on every turn that calls the same tool in the
+    same slot. Anthropic requires tool_use ids to be unique within a conversation
+    and clients key tool results by id, so a repeat collides with an earlier call
+    and gets reported as an interrupted tool use.
+
+    Only ids that look name-derived (or contain illegal characters) are rewritten;
+    genuinely random handles like `call_x7fa...` are passed through untouched.
+    Rewriting is safe either way: the id is only meaningful to the client, and the
+    request sent upstream keeps assistant tool_calls and tool messages internally
+    consistent.
+    """
+    if isinstance(upstream_id, str) and upstream_id:
+        if PRESERVE_UPSTREAM_TOOL_IDS:
+            return upstream_id
+        derived = False
+        if isinstance(tool_name, str) and len(tool_name) >= 3:
+            # e.g. "Edit:0", "Edit_1", "Read.2", "Bash3" -- tool name plus a
+            # positional index. Real tool names are >= 3 chars, so a short name
+            # cannot accidentally match a random id.
+            derived = bool(
+                re.fullmatch(
+                    re.escape(tool_name) + r"[-_:.]?\d*", upstream_id, re.IGNORECASE
+                )
+            )
+        if _PLAIN_TOOL_ID.match(upstream_id) and not derived:
+            return upstream_id
+        logger.debug(
+            f"Rewriting tool id {upstream_id!r} for tool {tool_name!r}: "
+            f"looks derived from the tool name and will repeat across turns"
+        )
+    return f"toolu_{uuid.uuid4().hex[:24]}"
+
+
 def _sse(event_type: str, payload: Dict[str, Any]) -> str:
     if DUMP_EVENTS:
         logger.warning(f"SSE-> {event_type}: {json.dumps(payload, ensure_ascii=False)[:600]}")
@@ -1425,7 +1639,28 @@ class _BlockTracker:
 
     def close(self):
         if self.open_type is not None:
-            out = _sse("content_block_stop", {"type": "content_block_stop", "index": self.index})
+            out = ""
+            if self.open_type == "thinking":
+                # Anthropic closes a thinking block with a signature_delta, and
+                # clients that verify block shape drop thinking blocks that never
+                # receive one. We cannot mint a real Anthropic signature for a
+                # third-party backend, so emit a clearly-marked placeholder: it is
+                # only ever consumed by this proxy, which strips thinking blocks
+                # back out of conversation history before they reach any backend.
+                out += _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": self.index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": PROXY_THINKING_SIGNATURE,
+                        },
+                    },
+                )
+            out += _sse(
+                "content_block_stop", {"type": "content_block_stop", "index": self.index}
+            )
             self.open_type = None
             return out
         return ""
@@ -1452,13 +1687,10 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
     accumulated_text = ""
 
     tracker = _BlockTracker()
-    # Per-upstream-tool-call state. A flat index->block map is not enough: some
-    # providers send the function name in a later chunk than the one that opens
-    # the call, and split arguments across many chunks. We therefore buffer each
-    # call and open its Anthropic block lazily, once the name is actually known.
+    # Per-upstream-tool-call state. Tool calls are buffered in full and emitted as
+    # complete blocks once the stream ends, because Anthropic content blocks cannot
+    # be reopened once closed.
     tool_states: Dict[Any, Dict[str, Any]] = {}
-    # Text seen while a tool block is still awaiting the rest of its arguments.
-    pending_text = ""
     emitted_stop = False
 
     def _args_complete(buf: str) -> bool:
@@ -1470,15 +1702,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             return True
         except (json.JSONDecodeError, TypeError):
             return False
-
-    def _open_tool_upstream_index():
-        """Which upstream tool call owns the currently open block, if any."""
-        if tracker.open_type != "tool_use":
-            return None
-        for key, st in tool_states.items():
-            if st.get("block_index") == tracker.index:
-                return key
-        return None
 
     def _emit_text(txt: str):
         out = []
@@ -1497,42 +1720,6 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 },
             )
         )
-        return out
-
-    def _open_tool_block(key):
-        """Open the Anthropic tool_use block and flush whatever args we buffered."""
-        st = tool_states[key]
-        out = []
-        closed = tracker.close()
-        if closed:
-            out.append(closed)
-        out.append(
-            tracker.open(
-                "tool_use",
-                {
-                    "type": "tool_use",
-                    "id": st["id"] or f"toolu_{uuid.uuid4().hex[:24]}",
-                    "name": st["name"] or "unknown",
-                    "input": {},
-                },
-            )
-        )
-        st["block_index"] = tracker.index
-        if st["args"]:
-            out.append(
-                _sse(
-                    "content_block_delta",
-                    {
-                        "type": "content_block_delta",
-                        "index": st["block_index"],
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": st["args"],
-                        },
-                    },
-                )
-            )
-            st["flushed"] = len(st["args"])
         return out
 
     try:
@@ -1560,9 +1747,31 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             },
         )
         yield _sse("ping", {"type": "ping"})
+        last_emit_at = time.monotonic()
+        stream_started_at = last_emit_at
+        upstream_chunks = 0
+        first_chunk_at = None
+        text_delta_count = 0
 
-        async for chunk in response_generator:
+        async for chunk in _iter_with_idle_timeout(
+            response_generator, UPSTREAM_IDLE_TIMEOUT
+        ):
             try:
+                upstream_chunks += 1
+                if first_chunk_at is None:
+                    first_chunk_at = time.monotonic()
+
+                # While tool arguments accumulate the proxy emits no content at
+                # all. On a large Edit/Write that is tens of seconds of dead air,
+                # and clients time the connection out mid-generation. Ping to keep
+                # it alive; pings are valid anywhere in an Anthropic stream.
+                if (
+                    STREAM_KEEPALIVE_SECONDS
+                    and time.monotonic() - last_emit_at >= STREAM_KEEPALIVE_SECONDS
+                ):
+                    last_emit_at = time.monotonic()
+                    yield _sse("ping", {"type": "ping"})
+
                 # Usage can arrive on any chunk; with stream_options.include_usage
                 # it lands on a final chunk that has an empty choices array.
                 usage_obj = getattr(chunk, "usage", None)
@@ -1601,7 +1810,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         if closed:
                             yield closed
                         yield tracker.open(
-                            "thinking", {"type": "thinking", "thinking": "", "signature": ""}
+                            "thinking", {"type": "thinking", "thinking": ""}
                         )
                     yield _sse(
                         "content_block_delta",
@@ -1615,33 +1824,43 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 # ---- text ----
                 delta_content = _block_get(delta, "content", None)
                 if delta_content:
-                    open_tool_key = _open_tool_upstream_index()
-                    args_pending = (
-                        open_tool_key is not None
-                        and not _args_complete(tool_states[open_tool_key]["args"])
-                    )
-                    if args_pending:
-                        # A tool block is open and its argument JSON is still
-                        # incomplete. Closing it here to start a text block would
-                        # strand the remaining argument deltas on a closed block,
-                        # producing a truncated tool_use that the client reports as
-                        # an interrupted tool call. Whitespace here is just the
-                        # separator some backends emit between calls, so drop it;
-                        # real text is deferred until the call is complete.
-                        if delta_content.strip():
-                            pending_text += delta_content
-                    else:
-                        if pending_text:
-                            for s in _emit_text(pending_text):
-                                yield s
-                            accumulated_text += pending_text
-                            pending_text = ""
-                        for s in _emit_text(delta_content):
-                            yield s
-                        accumulated_text += delta_content
+                    # Tool blocks are no longer opened mid-stream, so text can
+                    # always stream immediately without risk of landing on a
+                    # tool_use block.
+                    for s in _emit_text(delta_content):
+                        yield s
+                    accumulated_text += delta_content
+                    text_delta_count += 1
+                    last_emit_at = time.monotonic()
 
                 # ---- tool calls ----
+                # Accumulate only. Anthropic content blocks cannot be reopened once
+                # closed, so opening a tool block while its arguments are still
+                # arriving means any fragment that shows up after another block has
+                # opened (parallel calls, interleaved indices) is unrepresentable
+                # and gets dropped -- which silently truncates the JSON on exactly
+                # the largest payloads, i.e. file edits. Buffer everything and emit
+                # complete, well-formed tool_use blocks at the end of the stream.
                 delta_tool_calls = _block_get(delta, "tool_calls", None)
+
+                # Some gateways still emit the pre-2023 `function_call` shape
+                # instead of `tool_calls`. Ignoring it means the tool call is
+                # invisible to us, the turn looks like an empty reply, and the
+                # agent loop halts with no error anywhere.
+                if not delta_tool_calls:
+                    legacy = _block_get(delta, "function_call", None)
+                    if legacy:
+                        delta_tool_calls = [
+                            {
+                                "index": 0,
+                                "id": _block_get(legacy, "id", None),
+                                "function": {
+                                    "name": _block_get(legacy, "name", None),
+                                    "arguments": _block_get(legacy, "arguments", None),
+                                },
+                            }
+                        ]
+                        logger.debug("Translated legacy function_call delta")
                 if delta_tool_calls:
                     if not isinstance(delta_tool_calls, list):
                         delta_tool_calls = [delta_tool_calls]
@@ -1659,15 +1878,12 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
 
                         st = tool_states.setdefault(
                             upstream_index,
-                            {"id": None, "name": None, "args": "", "block_index": None,
-                             "flushed": 0},
+                            {"id": None, "name": None, "args": "", "order": len(tool_states)},
                         )
                         if call_id and not st["id"]:
                             st["id"] = call_id
-                        # First non-empty name wins. Opening the block with an empty
-                        # name (as the previous version did whenever the provider
-                        # sent id and name in separate chunks) yields a nameless
-                        # tool_use that the client cannot execute.
+                        # First non-empty name wins; some backends send the name in
+                        # a later chunk than the one that opens the call.
                         if name and not st["name"]:
                             st["name"] = name
                         if arguments:
@@ -1675,78 +1891,12 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 arguments = json.dumps(arguments, ensure_ascii=False)
                             st["args"] += arguments
 
-                        if st["block_index"] is None:
-                            # Wait for the name before opening the block.
-                            if st["name"]:
-                                for s in _open_tool_block(upstream_index):
-                                    yield s
-                        elif (
-                            tracker.open_type == "tool_use"
-                            and tracker.index == st["block_index"]
-                        ):
-                            unflushed = st["args"][st["flushed"] :]
-                            if unflushed:
-                                yield _sse(
-                                    "content_block_delta",
-                                    {
-                                        "type": "content_block_delta",
-                                        "index": st["block_index"],
-                                        "delta": {
-                                            "type": "input_json_delta",
-                                            "partial_json": unflushed,
-                                        },
-                                    },
-                                )
-                                st["flushed"] = len(st["args"])
-                        else:
-                            # Its block was already closed; Anthropic blocks cannot
-                            # be reopened. Keep buffering so nothing is lost, and
-                            # warn because this means a backend interleaved output
-                            # in a way we could not represent.
-                            logger.warning(
-                                f"Late arguments for closed tool block "
-                                f"{st['id']!r}; {len(st['args']) - st['flushed']} "
-                                f"chars could not be streamed"
-                            )
-
                 # ---- completion ----
                 if finish_reason and not emitted_stop:
                     emitted_stop = True
                     stop_reason = map_finish_reason(
                         finish_reason, has_tool_use=bool(tool_states)
                     )
-
-                    # A tool whose name never arrived was never opened; emit it now
-                    # rather than dropping the call entirely.
-                    for key, st in tool_states.items():
-                        if st["block_index"] is None:
-                            if st["id"] or st["args"] or st["name"]:
-                                for s in _open_tool_block(key):
-                                    yield s
-                        elif st["flushed"] < len(st["args"]):
-                            if (
-                                tracker.open_type == "tool_use"
-                                and tracker.index == st["block_index"]
-                            ):
-                                yield _sse(
-                                    "content_block_delta",
-                                    {
-                                        "type": "content_block_delta",
-                                        "index": st["block_index"],
-                                        "delta": {
-                                            "type": "input_json_delta",
-                                            "partial_json": st["args"][st["flushed"] :],
-                                        },
-                                    },
-                                )
-                                st["flushed"] = len(st["args"])
-
-                    # Text deferred while a tool call was still assembling.
-                    if pending_text:
-                        for s in _emit_text(pending_text):
-                            yield s
-                        accumulated_text += pending_text
-                        pending_text = ""
 
                     if original_request.stop_sequences and accumulated_text:
                         for seq in original_request.stop_sequences:
@@ -1765,32 +1915,115 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 logger.error(f"Error processing chunk: {chunk_error}")
                 continue
 
+        if DUMP_EVENTS:
+            now = time.monotonic()
+            ttfc = (first_chunk_at - stream_started_at) if first_chunk_at else -1
+            reasoning_only = upstream_chunks - text_delta_count
+            logger.warning(
+                "STREAM-PROFILE: upstream_chunks=%d text_deltas=%d "
+                "non_text_chunks=%d tool_calls=%d "
+                "time_to_first_chunk=%.2fs total=%.2fs\n"
+                "  If text_deltas is ~1, the backend sent the whole answer in one "
+                "chunk (upstream buffering).\n"
+                "  If non_text_chunks is large and text_deltas is small, the time "
+                "went into reasoning that is being dropped -- set "
+                "EMIT_REASONING=always to stream it.\n"
+                "  Tool call arguments are buffered by design and always appear at "
+                "once.",
+                upstream_chunks, text_delta_count, reasoning_only,
+                len(tool_states), ttfc, now - stream_started_at,
+            )
+
+        # An assistant turn with no text and no tool calls ends the agent loop with
+        # nothing shown. That is almost always a backend problem (context window
+        # exceeded, upstream filter, quota, an unrecognised response shape), but as
+        # a well-formed empty message it is indistinguishable from the model simply
+        # choosing to stop. Surface it.
+        produced_nothing = not accumulated_text.strip() and not tool_states
+        if produced_nothing:
+            logger.warning(
+                "EMPTY COMPLETION: backend returned no text and no tool calls "
+                "(upstream_chunks=%d, finish_reason=%s, input_tokens=%s). "
+                "Common causes: prompt exceeded the backend's context window, "
+                "upstream content filter, or an unrecognised response shape. "
+                "Run with DUMP_EVENTS=true to see the raw stream.",
+                upstream_chunks, stop_reason, input_tokens or "unknown",
+            )
+            if ERROR_ON_EMPTY_RESPONSE:
+                yield _sse(
+                    "error",
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": (
+                                "Backend returned an empty completion (no text, no "
+                                "tool calls) after "
+                                f"{upstream_chunks} chunks. This usually means the "
+                                "prompt exceeded the backend's context window. Set "
+                                "ERROR_ON_EMPTY_RESPONSE=false to suppress."
+                            ),
+                        },
+                    },
+                )
+                yield _sse("message_stop", {"type": "message_stop"})
+                yield "data: [DONE]\n\n"
+                return
+
+        # Close whatever text block is still open.
+        closed = tracker.close()
+        if closed:
+            yield closed
+
+        # Emit every buffered tool call as a complete, well-formed block, in the
+        # order the backend introduced them.
+        for key in sorted(tool_states, key=lambda k: tool_states[k]["order"]):
+            st = tool_states[key]
+            if not (st["id"] or st["name"] or st["args"]):
+                continue
+            args = st["args"]
+            if not _args_complete(args):
+                repaired = _repair_truncated_json(args)
+                logger.warning(
+                    f"Tool {st['name']!r} arguments were not valid JSON "
+                    f"({len(args)} chars); "
+                    + ("repaired" if repaired is not None else "sending as-is")
+                )
+                if repaired is not None:
+                    args = repaired
+            yield tracker.open(
+                "tool_use",
+                {
+                    "type": "tool_use",
+                    "id": _client_tool_id(st["id"], st["name"]),
+                    "name": st["name"] or "unknown",
+                    "input": {},
+                },
+            )
+            if args:
+                yield _sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": tracker.index,
+                        "delta": {"type": "input_json_delta", "partial_json": args},
+                    },
+                )
+            closed = tracker.close()
+            if closed:
+                yield closed
+
         # Anthropic requires at least one content block in the message.
         if tracker.index == -1:
             yield tracker.open("text", {"type": "text", "text": ""})
             closed = tracker.close()
             if closed:
                 yield closed
-        else:
-            closed = tracker.close()
-            if closed:
-                yield closed
 
         # Some backends end the stream without ever sending a finish_reason. If we
         # emitted tool calls, the turn is still a tool turn.
-        if not emitted_stop and tool_states and stop_reason == "end_turn":
+        if tool_states and stop_reason == "end_turn":
             stop_reason = "tool_use"
-
-        # Truncated argument JSON means the client cannot run the call; surfacing
-        # max_tokens is more accurate (and more debuggable) than a clean tool_use.
-        for st in tool_states.values():
-            if st["args"] and not _args_complete(st["args"]):
-                logger.warning(
-                    f"Tool {st['name']!r} has incomplete argument JSON "
-                    f"({len(st['args'])} chars); the call will not be runnable"
-                )
-                if stop_reason == "tool_use":
-                    stop_reason = "max_tokens"
 
         yield _sse(
             "message_delta",

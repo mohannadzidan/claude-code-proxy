@@ -3,7 +3,7 @@ from fastapi.exceptions import RequestValidationError
 import uvicorn
 import logging
 import json
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
@@ -17,6 +17,10 @@ from dotenv import load_dotenv
 import re
 from datetime import datetime
 import sys
+from pathlib import Path
+from urllib.parse import urlparse
+from dataclasses import dataclass
+import yaml
 sys.stdout.reconfigure(encoding='utf-8')
 
 # Load environment variables from .env file
@@ -184,59 +188,211 @@ for handler in logger.handlers:
 
 app = FastAPI()
 
-# Get API keys from environment
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Get Vertex AI project and location from environment (if set)
-VERTEX_PROJECT = os.environ.get("VERTEX_PROJECT", "unset")
-VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
+# ---------------------------------------------------------------------------
+# router.yaml: centralized model routing configuration.
+#
+# Replaces the old BIG_MODEL/SMALL_MODEL/MIDDLE_MODEL/PREFERRED_PROVIDER/
+# OPENAI_BASE_URL/*_API_KEY env vars. Those are no longer read by this server.
+# ---------------------------------------------------------------------------
 
-# Option to use Gemini API key instead of ADC for Vertex AI
-USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
+class RouterConfigError(Exception):
+    """Raised when router.yaml is missing, malformed, or fails validation."""
 
-# Get OpenAI base URL from environment (if set)
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 
-# Get preferred provider (default to openai)
-PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
+VALID_ENDPOINT_TYPES = {"openai", "anthropic", "gemini"}
+REQUIRED_MODEL_FIELDS = ("id", "providerModelName", "endpointType", "providerApiKey")
 
-# Get model mapping configuration from environment
-# Default to latest OpenAI models if not set
-BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+# ${ENV_VAR} or ${ENV_VAR:-default_value}
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(:-([^}]*))?\}")
 
-# List of OpenAI models
-OPENAI_MODELS = [
-    "o3-mini",
-    "o1",
-    "o1-mini",
-    "o1-pro",
-    "gpt-4.5-preview",
-    "gpt-4o",
-    "gpt-4o-audio-preview",
-    "chatgpt-4o-latest",
-    "gpt-4o-mini",
-    "gpt-4o-mini-audio-preview",
-    "gpt-4.1",  # Added default big model
-    "gpt-4.1-mini",  # Added default small model
-]
 
-# List of Gemini models
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+def _interpolate_env_string(value: str) -> str:
+    def _replace(match: "re.Match") -> str:
+        var_name = match.group(1)
+        has_default = match.group(2) is not None
+        default = match.group(3) if has_default else None
+        env_value = os.environ.get(var_name)
+        if env_value is not None:
+            return env_value
+        return default if has_default else ""
 
-# Claude Code addresses three tiers. Previously only haiku/sonnet were mapped, so
-# every Opus request fell through unmapped and was sent verbatim to OpenAI.
-MIDDLE_MODEL = os.environ.get("MIDDLE_MODEL", BIG_MODEL)
+    return _ENV_VAR_PATTERN.sub(_replace, value)
 
-# Extra model ids the operator wants to expose, e.g. for a local vLLM / Ollama /
-# OpenRouter endpoint whose names we cannot know ahead of time.
-OPENAI_MODELS = OPENAI_MODELS + [
-    m.strip()
-    for m in os.environ.get("OPENAI_EXTRA_MODELS", "").split(",")
-    if m.strip()
-]
+
+def _interpolate_env(value: Any) -> Any:
+    """Recursively apply ${ENV_VAR} / ${ENV_VAR:-default} interpolation."""
+    if isinstance(value, str):
+        return _interpolate_env_string(value)
+    if isinstance(value, dict):
+        return {k: _interpolate_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_interpolate_env(v) for v in value]
+    return value
+
+
+@dataclass
+class ModelEntry:
+    id: str
+    providerModelName: str
+    endpointType: str
+    providerApiKey: str
+    providerBaseUrl: Optional[str] = None
+    displayName: Optional[str] = None
+
+
+@dataclass
+class ResolvedModel:
+    id: str
+    providerModelName: str
+    endpointType: str
+    providerApiKey: str
+    providerBaseUrl: Optional[str] = None
+    displayName: Optional[str] = None
+
+    @property
+    def litellm_model(self) -> str:
+        return self.providerModelName
+
+    @property
+    def litellm_provider(self) -> str:
+        return self.endpointType
+
+
+@dataclass
+class RouterConfig:
+    preferredModel: str
+    models: List[ModelEntry]
+    preferredModelHaiku: Optional[str] = None
+    preferredModelSonnet: Optional[str] = None
+    preferredModelOpus: Optional[str] = None
+
+
+def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
+    if not isinstance(raw, dict):
+        raise RouterConfigError(
+            "router.yaml must contain a YAML mapping at the top level"
+        )
+
+    raw_models = raw.get("models")
+    if not isinstance(raw_models, list) or not raw_models:
+        raise RouterConfigError("router.yaml: 'models' must be a non-empty list")
+
+    models: List[ModelEntry] = []
+    ids_seen: set = set()
+    for idx, raw_entry in enumerate(raw_models):
+        if not isinstance(raw_entry, dict):
+            raise RouterConfigError(f"Entry {idx}: must be a mapping")
+        entry = _interpolate_env(raw_entry)
+
+        for field_name in REQUIRED_MODEL_FIELDS:
+            if not entry.get(field_name):
+                raise RouterConfigError(
+                    f"Entry {idx}: missing required field '{field_name}'"
+                )
+
+        endpoint_type = entry["endpointType"]
+        if endpoint_type not in VALID_ENDPOINT_TYPES:
+            raise RouterConfigError(
+                f"Entry {idx}: invalid endpointType '{endpoint_type}' "
+                f"(must be one of {sorted(VALID_ENDPOINT_TYPES)})"
+            )
+
+        models.append(
+            ModelEntry(
+                id=entry["id"],
+                providerModelName=entry["providerModelName"],
+                endpointType=endpoint_type,
+                providerApiKey=entry["providerApiKey"],
+                providerBaseUrl=entry.get("providerBaseUrl") or None,
+                displayName=entry.get("displayName") or None,
+            )
+        )
+        ids_seen.add(entry["id"])
+
+    preferred_model = _interpolate_env(raw.get("preferredModel"))
+    if not preferred_model:
+        raise RouterConfigError("router.yaml: 'preferredModel' is required")
+
+    def _tier_override(key: str) -> Optional[str]:
+        v = raw.get(key)
+        return _interpolate_env(v) if v else None
+
+    preferred_haiku = _tier_override("preferredModelHaiku")
+    preferred_sonnet = _tier_override("preferredModelSonnet")
+    preferred_opus = _tier_override("preferredModelOpus")
+
+    for label, target in (
+        ("preferredModel", preferred_model),
+        ("preferredModelHaiku", preferred_haiku),
+        ("preferredModelSonnet", preferred_sonnet),
+        ("preferredModelOpus", preferred_opus),
+    ):
+        if target is not None and target not in ids_seen:
+            raise RouterConfigError(
+                f"router.yaml: {label}='{target}' does not match any models[].id"
+            )
+
+    return RouterConfig(
+        preferredModel=preferred_model,
+        models=models,
+        preferredModelHaiku=preferred_haiku,
+        preferredModelSonnet=preferred_sonnet,
+        preferredModelOpus=preferred_opus,
+    )
+
+
+def load_router_config(path: Path) -> RouterConfig:
+    if not path.exists():
+        raise RouterConfigError("router.yaml not found. Please create it.")
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise RouterConfigError(f"router.yaml: malformed YAML: {e}")
+    return _parse_router_config(raw or {})
+
+
+ROUTER_CONFIG_PATH = Path(__file__).resolve().parent / "router.yaml"
+
+try:
+    ROUTER_CONFIG = load_router_config(ROUTER_CONFIG_PATH)
+except RouterConfigError as e:
+    logger.critical(str(e))
+    sys.exit(1)
+
+logger.warning(
+    f"Loaded router.yaml: {len(ROUTER_CONFIG.models)} model entries. "
+    f"Preferred: {ROUTER_CONFIG.preferredModel}"
+)
+
+
+def getModel(tier: Optional[Literal["haiku", "sonnet", "opus"]] = None) -> ResolvedModel:
+    """Resolve a Claude tier onto its configured upstream model."""
+    if tier == "haiku":
+        target_id = ROUTER_CONFIG.preferredModelHaiku or ROUTER_CONFIG.preferredModel
+    elif tier == "sonnet":
+        target_id = ROUTER_CONFIG.preferredModelSonnet or ROUTER_CONFIG.preferredModel
+    elif tier == "opus":
+        target_id = ROUTER_CONFIG.preferredModelOpus or ROUTER_CONFIG.preferredModel
+    else:
+        target_id = ROUTER_CONFIG.preferredModel
+
+    for entry in ROUTER_CONFIG.models:
+        if entry.id == target_id:
+            return ResolvedModel(
+                id=entry.id,
+                providerModelName=entry.providerModelName,
+                endpointType=entry.endpointType,
+                providerApiKey=entry.providerApiKey,
+                providerBaseUrl=entry.providerBaseUrl,
+                displayName=entry.displayName,
+            )
+
+    # Startup validation guarantees every preferred* id resolves; this only
+    # triggers if router.yaml is mutated after the process started.
+    raise RouterConfigError(f"No model entry found for id '{target_id}' (tier={tier!r})")
+
 
 # Output-token ceiling. The old code hardcoded 16384, which silently truncated
 # long edits on models that support far more.
@@ -332,57 +488,20 @@ def supports_temperature(model: str) -> bool:
     return not is_reasoning_model(model)
 
 
-def map_model_name(v: str, context: str = "MODEL") -> str:
-    """Map an Anthropic model id onto the configured backend model.
+def extract_tier(v: str) -> Optional[Literal["haiku", "sonnet", "opus"]]:
+    """Extract the Claude tier (haiku/sonnet/opus) from an incoming model id.
 
-    Shared by MessagesRequest and TokenCountRequest so the two endpoints can never
-    disagree about which upstream model a request belongs to (they used to, which
-    made Claude Code's context math wrong).
+    router.yaml resolves the actual upstream model; this only determines which
+    tier's preferredModel* the request belongs to.
     """
-    original_model = v
-    clean_v = strip_provider_prefix(v)
-    lowered = clean_v.lower()
-
-    def _target(model_name: str) -> str:
-        # Respect an explicit prefix in the env var, e.g. BIG_MODEL="openrouter/x".
-        if "/" in model_name:
-            return model_name
-        if PREFERRED_PROVIDER == "google" and model_name in GEMINI_MODELS:
-            return f"gemini/{model_name}"
-        if PREFERRED_PROVIDER not in ("openai", "google", "anthropic"):
-            return f"{PREFERRED_PROVIDER}/{model_name}"
-        return f"openai/{model_name}"
-
-    new_model = v
-    mapped = False
-
-    if PREFERRED_PROVIDER == "anthropic":
-        new_model = f"anthropic/{clean_v}"
-        mapped = True
-    elif "haiku" in lowered:
-        new_model = _target(SMALL_MODEL)
-        mapped = True
-    elif "sonnet" in lowered:
-        new_model = _target(BIG_MODEL)
-        mapped = True
-    elif "opus" in lowered:
-        new_model = _target(MIDDLE_MODEL)
-        mapped = True
-    elif clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-        new_model = f"gemini/{clean_v}"
-        mapped = True
-    elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-        new_model = f"openai/{clean_v}"
-        mapped = True
-    elif not v.startswith(("openai/", "gemini/", "anthropic/")):
-        # Unknown id and no prefix: assume it belongs to the configured provider
-        # rather than shipping a bare name LiteLLM will try to route to Anthropic.
-        new_model = _target(clean_v)
-        mapped = True
-
-    if mapped:
-        logger.debug(f"📌 {context} MAPPING: '{original_model}' ➡️ '{new_model}'")
-    return new_model
+    lowered = strip_provider_prefix(v or "").lower()
+    if "haiku" in lowered:
+        return "haiku"
+    if "sonnet" in lowered:
+        return "sonnet"
+    if "opus" in lowered:
+        return "opus"
+    return None
 
 
 # Helper function to clean schema for Gemini
@@ -550,6 +669,7 @@ class MessagesRequest(BaseModel):
     tool_choice: Optional[Union[Dict[str, Any], str]] = None
     thinking: Optional[ThinkingConfig] = None
     original_model: Optional[str] = None  # Will store the original model name
+    model_tier: Optional[Literal["haiku", "sonnet", "opus"]] = None  # Derived from original_model
 
     # mode="before" is required: a field_validator cannot populate a *sibling*
     # field. The previous code assigned into `info.data`, which Pydantic v2
@@ -563,9 +683,10 @@ class MessagesRequest(BaseModel):
             data.setdefault("original_model", data["model"])
         return data
 
-    @field_validator("model")
-    def validate_model_field(cls, v, info):
-        return map_model_name(v, "MODEL")
+    @model_validator(mode="after")
+    def compute_model_tier(self):
+        self.model_tier = extract_tier(self.original_model or self.model)
+        return self
 
 
 class TokenCountRequest(BaseModel):
@@ -577,6 +698,7 @@ class TokenCountRequest(BaseModel):
     thinking: Optional[ThinkingConfig] = None
     tool_choice: Optional[Union[Dict[str, Any], str]] = None
     original_model: Optional[str] = None  # Will store the original model name
+    model_tier: Optional[Literal["haiku", "sonnet", "opus"]] = None  # Derived from original_model
 
     @model_validator(mode="before")
     @classmethod
@@ -585,9 +707,10 @@ class TokenCountRequest(BaseModel):
             data.setdefault("original_model", data["model"])
         return data
 
-    @field_validator("model")
-    def validate_model_token_count(cls, v, info):
-        return map_model_name(v, "TOKEN COUNT")
+    @model_validator(mode="after")
+    def compute_model_tier(self):
+        self.model_tier = extract_tier(self.original_model or self.model)
+        return self
 
 
 class TokenCountResponse(BaseModel):
@@ -803,7 +926,9 @@ def _system_role_for(model: str) -> Optional[str]:
     return "system"
 
 
-def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
+def convert_anthropic_to_litellm(
+    anthropic_request: MessagesRequest, resolved: ResolvedModel
+) -> Dict[str, Any]:
     """Convert an Anthropic Messages request into OpenAI/LiteLLM shape.
 
     The important part is that Anthropic tool_use / tool_result blocks become real
@@ -811,8 +936,14 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     stringified them ("Tool result for toolu_123: ..."), which destroyed the
     tool-calling contract: the backend never saw a structured call/result pair, so
     multi-turn agentic loops degraded into the model re-describing tools in prose.
+
+    `resolved` is the router.yaml entry chosen for this request's tier: it supplies
+    the exact upstream model name/provider/credentials, separate from whatever
+    Claude model id the client sent.
     """
-    target_model = anthropic_request.model
+    target_model = resolved.litellm_model
+    is_anthropic_model = resolved.litellm_provider == "anthropic"
+    is_gemini_model = resolved.litellm_provider == "gemini"
     messages: List[Dict[str, Any]] = []
 
     # ---------- system ----------
@@ -969,16 +1100,20 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     max_tokens = anthropic_request.max_tokens
     if MAX_TOKENS_LIMIT:
         max_tokens = min(max_tokens, MAX_TOKENS_LIMIT)
-    elif COMPAT_MODE and not target_model.startswith("anthropic/"):
+    elif COMPAT_MODE and not is_anthropic_model:
         # The pre-patch proxy hardcoded this cap; some gateways reject or stall on
         # larger values than the backing model advertises.
         max_tokens = min(max_tokens, 16384)
 
     litellm_request: Dict[str, Any] = {
         "model": target_model,
+        "custom_llm_provider": resolved.litellm_provider,
+        "api_key": resolved.providerApiKey,
         "messages": messages,
         "stream": bool(anthropic_request.stream),
     }
+    if resolved.providerBaseUrl:
+        litellm_request["api_base"] = resolved.providerBaseUrl
 
     # Reasoning models require max_completion_tokens; some gateways only know
     # max_tokens. `auto` picks per-model, and the env var forces one.
@@ -997,7 +1132,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             litellm_request["temperature"] = anthropic_request.temperature
         if anthropic_request.top_p is not None:
             litellm_request["top_p"] = anthropic_request.top_p
-        if anthropic_request.top_k is not None and target_model.startswith("gemini/"):
+        if anthropic_request.top_k is not None and is_gemini_model:
             # top_k is not an OpenAI parameter; only forward where it is real.
             litellm_request["top_k"] = anthropic_request.top_k
         if anthropic_request.stop_sequences:
@@ -1006,7 +1141,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
     # Map Anthropic's thinking budget onto OpenAI's reasoning_effort.
     if anthropic_request.thinking is not None and anthropic_request.thinking.is_enabled:
-        if target_model.startswith("anthropic/"):
+        if is_anthropic_model:
             thinking_payload = {"type": "enabled"}
             if anthropic_request.thinking.budget_tokens:
                 thinking_payload["budget_tokens"] = anthropic_request.thinking.budget_tokens
@@ -1043,7 +1178,6 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     # ---------- tools ----------
     if anthropic_request.tools:
         openai_tools = []
-        is_gemini_model = target_model.startswith("gemini/")
         for tool in anthropic_request.tools:
             tool_dict = (
                 tool.model_dump(exclude_none=True)
@@ -2082,45 +2216,20 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         if "/" in display_model:
             display_model = display_model.split("/")[-1]
 
-        # Clean model name for capability check
-        clean_model = request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/") :]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/") :]
+        resolved = getModel(request.model_tier)
+        logger.debug(
+            f"📌 MODEL ROUTING: tier={request.model_tier!r} -> id={resolved.id!r} "
+            f"(provider={resolved.litellm_provider}, upstream={resolved.providerModelName!r})"
+        )
+        resolved_display = resolved.displayName or resolved.id
 
         logger.debug(
             f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}"
         )
 
-        # Convert Anthropic request to LiteLLM format
-        litellm_request = convert_anthropic_to_litellm(request)
-
-        # Determine which API key to use based on the model
-        if request.model.startswith("openai/"):
-            litellm_request["api_key"] = OPENAI_API_KEY
-            # Use custom OpenAI base URL if configured
-            if OPENAI_BASE_URL:
-                litellm_request["api_base"] = OPENAI_BASE_URL
-                logger.debug(
-                    f"Using OpenAI API key and custom base URL {OPENAI_BASE_URL} for model: {request.model}"
-                )
-            else:
-                logger.debug(f"Using OpenAI API key for model: {request.model}")
-        elif request.model.startswith("gemini/"):
-            if USE_VERTEX_AUTH:
-                litellm_request["vertex_project"] = VERTEX_PROJECT
-                litellm_request["vertex_location"] = VERTEX_LOCATION
-                litellm_request["custom_llm_provider"] = "vertex_ai"
-                logger.debug(
-                    f"Using Gemini ADC with project={VERTEX_PROJECT}, location={VERTEX_LOCATION} and model: {request.model}"
-                )
-            else:
-                litellm_request["api_key"] = GEMINI_API_KEY
-                logger.debug(f"Using Gemini API key for model: {request.model}")
-        else:
-            litellm_request["api_key"] = ANTHROPIC_API_KEY
-            logger.debug(f"Using Anthropic API key for model: {request.model}")
+        # Convert Anthropic request to LiteLLM format. This also fills in the
+        # target model/provider/api_key/api_base from `resolved`.
+        litellm_request = convert_anthropic_to_litellm(request, resolved)
 
         # NOTE: the legacy "flatten every content block into a string" pass that
         # used to live here has been removed. convert_anthropic_to_litellm() now
@@ -2155,7 +2264,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 "POST",
                 raw_request.url.path,
                 display_model,
-                litellm_request.get("model"),
+                resolved_display,
                 len(litellm_request["messages"]),
                 num_tools,
                 None,  # in-flight; real status is logged on failure
@@ -2180,7 +2289,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 "POST",
                 raw_request.url.path,
                 display_model,
-                litellm_request.get("model"),
+                resolved_display,
                 len(litellm_request["messages"]),
                 num_tools,
                 None,  # in-flight; real status is logged on failure
@@ -2256,11 +2365,17 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         except (TypeError, ValueError):
             status_code = 500
 
+        try:
+            error_resolved = getModel(request.model_tier)
+            error_resolved_display = error_resolved.displayName or error_resolved.id
+        except Exception:
+            error_resolved_display = request.model
+
         log_request_beautifully(
             "POST",
             raw_request.url.path,
             request.original_model or request.model,
-            request.model,
+            error_resolved_display,
             len(request.messages),
             len(request.tools) if request.tools else 0,
             status_code,
@@ -2292,12 +2407,8 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         if "/" in display_model:
             display_model = display_model.split("/")[-1]
 
-        # Clean model name for capability check
-        clean_model = request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/") :]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/") :]
+        resolved = getModel(request.model_tier)
+        resolved_display = resolved.displayName or resolved.id
 
         # Convert the messages to a format LiteLLM can understand
         converted_request = convert_anthropic_to_litellm(
@@ -2309,7 +2420,8 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 thinking=request.thinking,
-            )
+            ),
+            resolved,
         )
 
         # Use LiteLLM's token_counter function
@@ -2324,23 +2436,20 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
                 "POST",
                 raw_request.url.path,
                 display_model,
-                converted_request.get("model"),
+                resolved_display,
                 len(converted_request["messages"]),
                 num_tools,
                 None,  # in-flight; real status is logged on failure
             )
 
-            # Prepare token counter arguments
-            token_counter_args = {
-                "model": converted_request["model"],
-                "messages": converted_request["messages"],
-            }
-
-            # Add custom base URL for OpenAI models if configured
-            if request.model.startswith("openai/") and OPENAI_BASE_URL:
-                token_counter_args["api_base"] = OPENAI_BASE_URL
-
-            token_count = token_counter(**token_counter_args)
+            # litellm.token_counter() takes no api_base/api_key/custom_llm_provider
+            # in this version -- model is the only routing hint it accepts, and it
+            # picks a tokenizer from that alone (falling back to a generic one for
+            # unrecognized ids, which is the best available for custom gateways).
+            token_count = token_counter(
+                model=converted_request["model"],
+                messages=converted_request["messages"],
+            )
 
             # Tool definitions are part of the billed prompt but token_counter
             # ignores them. Claude Code uses this endpoint to decide when to
@@ -2426,37 +2535,38 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.get("/health")
 async def health():
-    """Liveness probe plus the effective model mapping, for debugging setups."""
+    """Liveness probe plus the effective router.yaml mapping, for debugging setups."""
+    resolved = getModel(None)
+    base_url_display = None
+    if resolved.providerBaseUrl:
+        base_url_display = urlparse(resolved.providerBaseUrl).netloc or resolved.providerBaseUrl
     return {
         "status": "ok",
-        "preferred_provider": PREFERRED_PROVIDER,
-        "big_model": BIG_MODEL,
-        "middle_model": MIDDLE_MODEL,
-        "small_model": SMALL_MODEL,
-        "openai_base_url": OPENAI_BASE_URL or "default",
-        "api_key_configured": bool(OPENAI_API_KEY or ANTHROPIC_API_KEY or GEMINI_API_KEY),
+        "preferredModel": resolved.id,
+        "endpointType": resolved.endpointType,
+        "providerBaseUrl": base_url_display,
+        "providerModelName": resolved.providerModelName,
+        "modelCount": len(ROUTER_CONFIG.models),
+        "source": "router.yaml",
     }
 
 
 @app.get("/v1/models")
 async def list_models():
-    """Minimal Anthropic-style model list; some clients probe this on startup."""
-    known = [
-        "claude-3-5-haiku-20241022",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-7-sonnet-20250219",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-    ]
+    """Model ids configured in router.yaml; clients probe this to discover choices."""
+    ids: List[str] = []
+    for entry in ROUTER_CONFIG.models:
+        if entry.id not in ids:
+            ids.append(entry.id)
     return {
         "data": [
             {
-                "id": m,
+                "id": mid,
                 "type": "model",
-                "display_name": m,
+                "display_name": mid,
                 "created_at": "2025-01-01T00:00:00Z",
             }
-            for m in known
+            for mid in ids
         ],
         "has_more": False,
     }
@@ -2482,9 +2592,14 @@ class Colors:
 
 
 def log_request_beautifully(
-    method, path, claude_model, openai_model, num_messages, num_tools, status_code
+    method, path, claude_model, resolved_model_display, num_messages, num_tools, status_code
 ):
-    """Log requests in a beautiful, twitter-friendly format showing Claude to OpenAI mapping."""
+    """Log requests in a beautiful, twitter-friendly format showing Claude to upstream mapping.
+
+    `resolved_model_display` must already be the router.yaml displayName/id to show
+    (not a raw providerModelName), since providerModelName can itself contain
+    slashes (e.g. "minimaxai/minimax-m3") that would be mangled by a naive split.
+    """
     # Format the Claude model name nicely
     claude_display = f"{Colors.CYAN}{claude_model}{Colors.RESET}"
 
@@ -2493,11 +2608,7 @@ def log_request_beautifully(
     if "?" in endpoint:
         endpoint = endpoint.split("?")[0]
 
-    # Extract just the OpenAI model name without provider prefix
-    openai_display = openai_model
-    if "/" in openai_display:
-        openai_display = openai_display.split("/")[-1]
-    openai_display = f"{Colors.GREEN}{openai_display}{Colors.RESET}"
+    openai_display = f"{Colors.GREEN}{resolved_model_display}{Colors.RESET}"
 
     # Format tools and messages
     tools_str = f"{Colors.MAGENTA}{num_tools} tools{Colors.RESET}"

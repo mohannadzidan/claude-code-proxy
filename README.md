@@ -11,9 +11,7 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
 
 ### Prerequisites
 
-- OpenAI API key 🔑
-- Google AI Studio (Gemini) API key (if using Google provider) 🔑
-- Google Cloud Project with Vertex AI API enabled (if using Application Default Credentials for Gemini) ☁️
+- API key(s) for whichever upstream provider(s) you route to 🔑
 - [uv](https://github.com/astral-sh/uv) installed.
 
 ### Setup 🛠️
@@ -32,27 +30,35 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
    ```
    *(`uv` will handle dependencies based on `pyproject.toml` when you run the server)*
 
-3. **Configure Environment Variables**:
-   Copy the example environment file:
+3. **Configure routing**:
+   Model routing (which upstream models to use, their endpoint URLs, and API keys)
+   lives in `router.yaml`, which is git-ignored since it holds secrets. Copy the
+   template and fill it in:
    ```bash
-   cp .env.example .env
+   cp router.yaml.example router.yaml
    ```
-   Edit `.env` and fill in your API keys and model configurations:
+   Since `router.yaml` is git-ignored, you can put real key values directly in
+   it -- there's no extra risk versus keeping them in `.env`:
+   ```yaml
+   preferredModel: openai/gpt-4.1
 
-   *   `ANTHROPIC_API_KEY`: (Optional) Needed only if proxying *to* Anthropic models.
-   *   `OPENAI_API_KEY`: Your OpenAI API key (Required if using the default OpenAI preference or as fallback).
-   *   `GEMINI_API_KEY`: Your Google AI Studio (Gemini) API key (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
-   *   `USE_VERTEX_AUTH` (Optional): Set to `true` to use Application Default Credentials (ADC) will be used (no static API key required). Note: when USE_VERTEX_AUTH=true, you must configure `VERTEX_PROJECT` and `VERTEX_LOCATION`.
-   *   `VERTEX_PROJECT` (Optional): Your Google Cloud Project ID (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
-   *   `VERTEX_LOCATION` (Optional): The Google Cloud region for Vertex AI (e.g., `us-central1`) (Required if `PREFERRED_PROVIDER=google` and `USE_VERTEX_AUTH=true`).
-   *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default), `google`, or `anthropic`. This determines the primary backend for mapping `haiku`/`sonnet`.
-   *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`. Ignored when `PREFERRED_PROVIDER=anthropic`.
-   *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`. Ignored when `PREFERRED_PROVIDER=anthropic`.
-
-   **Mapping Logic:**
-   - If `PREFERRED_PROVIDER=openai` (default), `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `openai/`.
-   - If `PREFERRED_PROVIDER=google`, `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `gemini/` *if* those models are in the server's known `GEMINI_MODELS` list (otherwise falls back to OpenAI mapping).
-   - If `PREFERRED_PROVIDER=anthropic`, `haiku`/`sonnet` requests are passed directly to Anthropic with the `anthropic/` prefix without remapping to different models.
+   models:
+     - id: openai/gpt-4.1
+       providerModelName: gpt-4.1
+       endpointType: openai
+       providerApiKey: sk-...
+   ```
+   `router.yaml` also supports `${ENV_VAR}` / `${ENV_VAR:-default}`
+   interpolation if you'd rather keep the actual values in `.env` (copy
+   `.env.example` to `.env`) and reference them instead -- useful when the
+   same `router.yaml` needs to work across multiple environments/machines
+   without editing the file itself:
+   ```yaml
+       providerApiKey: ${OPENAI_API_KEY}
+   ```
+   The server refuses to start if `router.yaml` is missing, malformed, or if
+   `preferredModel` (or any tier override) doesn't match a `models[].id`. See
+   [Model Routing](#model-routing-) below for the full schema.
 
 4. **Run the server**:
    ```bash
@@ -62,10 +68,12 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
 
 #### Docker
 
-If using docker, download the example environment file to `.env` and edit it as described above.
+If using docker, download `router.yaml.example` and (optionally) `.env.example`, then edit them as described above.
 ```bash
-curl -O .env https://raw.githubusercontent.com/1rgs/claude-code-proxy/refs/heads/main/.env.example
+curl -o router.yaml https://raw.githubusercontent.com/1rgs/claude-code-proxy/refs/heads/main/router.yaml.example
+curl -o .env https://raw.githubusercontent.com/1rgs/claude-code-proxy/refs/heads/main/.env.example
 ```
+`router.yaml` must be mounted into the container (e.g. `-v ./router.yaml:/app/router.yaml:ro`) since it isn't baked into the image.
 
 Then, you can either start the container with [docker compose](https://docs.docker.com/compose/) (preferred):
 
@@ -99,110 +107,61 @@ docker run -d --env-file .env -p 8082:8082 ghcr.io/1rgs/claude-code-proxy:latest
 
 3. **That's it!** Your Claude Code client will now use the configured backend models (defaulting to Gemini) through the proxy. 🎯
 
-## Model Mapping 🗺️
+## Model Routing 🗺️
 
-The proxy automatically maps Claude models to either OpenAI or Gemini models based on the configured model:
+Model routing is entirely configured in `router.yaml` (git-ignored — copy
+`router.yaml.example` to get started). It replaces the old
+`BIG_MODEL`/`SMALL_MODEL`/`MIDDLE_MODEL`/`PREFERRED_PROVIDER` environment
+variables, which are no longer read by the server.
 
-| Claude Model | Default Mapping | When BIG_MODEL/SMALL_MODEL is a Gemini model |
-|--------------|--------------|---------------------------|
-| haiku | openai/gpt-4o-mini | gemini/[model-name] |
-| sonnet | openai/gpt-4o | gemini/[model-name] |
+Claude Code addresses three tiers (`haiku`, `sonnet`, `opus`), detected from the
+`model` string the client sends. Each tier resolves to a model `id` in
+`router.yaml`:
 
-### Supported Models
+1. `preferredModelHaiku` / `preferredModelSonnet` / `preferredModelOpus`, if set
+2. Otherwise `preferredModel` (required)
 
-#### OpenAI Models
-The following OpenAI models are supported with automatic `openai/` prefix handling:
-- o3-mini
-- o1
-- o1-mini
-- o1-pro
-- gpt-4.5-preview
-- gpt-4o
-- gpt-4o-audio-preview
-- chatgpt-4o-latest
-- gpt-4o-mini
-- gpt-4o-mini-audio-preview
-- gpt-4.1
-- gpt-4.1-mini
+```yaml
+# router.yaml
+preferredModel: minimax/minimax-m3
+preferredModelHaiku: openai/gpt-4.1-mini   # optional per-tier override
+preferredModelSonnet: minimax/minimax-m3
+preferredModelOpus: anthropic/claude-opus-4-20250514
 
-#### Gemini Models
-The following Gemini models are supported with automatic `gemini/` prefix handling:
-- gemini-2.5-pro
-- gemini-2.5-flash
-
-### Model Prefix Handling
-The proxy automatically adds the appropriate prefix to model names:
-- OpenAI models get the `openai/` prefix
-- Gemini models get the `gemini/` prefix
-- The BIG_MODEL and SMALL_MODEL will get the appropriate prefix based on whether they're in the OpenAI or Gemini model lists
-
-For example:
-- `gpt-4o` becomes `openai/gpt-4o`
-- `gemini-2.5-pro-preview-03-25` becomes `gemini/gemini-2.5-pro-preview-03-25`
-- When BIG_MODEL is set to a Gemini model, Claude Sonnet will map to `gemini/[model-name]`
-
-### Customizing Model Mapping
-
-Control the mapping using environment variables in your `.env` file or directly:
-
-**Example 1: Default (Use OpenAI)**
-No changes needed in `.env` beyond API keys, or ensure:
-```dotenv
-OPENAI_API_KEY="your-openai-key"
-GEMINI_API_KEY="your-google-key" # Needed if PREFERRED_PROVIDER=google
-# PREFERRED_PROVIDER="openai" # Optional, it's the default
-# BIG_MODEL="gpt-4.1" # Optional, it's the default
-# SMALL_MODEL="gpt-4.1-mini" # Optional, it's the default
+models:
+  - id: minimax/minimax-m3              # LiteLLM routing id (lookup key)
+    providerModelName: minimaxai/minimax-m3  # exact string sent upstream
+    endpointType: openai                # openai | anthropic | gemini
+    providerBaseUrl: https://api.example.com/v1  # empty/omitted = provider default
+    providerApiKey: ${MINIMAX_API_KEY}  # supports ${VAR} / ${VAR:-default}
+    displayName: "MiniMax M3"           # optional, logging/health only
 ```
 
-**Example 2a: Prefer Google (using GEMINI_API_KEY)**
-```dotenv
-GEMINI_API_KEY="your-google-key"
-OPENAI_API_KEY="your-openai-key" # Needed for fallback
-PREFERRED_PROVIDER="google"
-# BIG_MODEL="gemini-2.5-pro" # Optional, it's the default for Google pref
-# SMALL_MODEL="gemini-2.5-flash" # Optional, it's the default for Google pref
-```
+`id` and `providerModelName` are deliberately separate: some upstream gateways
+expect a model name (`minimaxai/minimax-m3`) that LiteLLM would otherwise try to
+route internally as a different provider (`minimax/minimax-m3`). `id` is only
+ever used for lookup within this proxy; `providerModelName` is the literal
+string sent to the upstream API, and `endpointType` tells LiteLLM which
+protocol/provider to speak.
 
-**Example 2b: Prefer Google (using Vertex AI with Application Default Credentials)**
-```dotenv
-OPENAI_API_KEY="your-openai-key" # Needed for fallback
-PREFERRED_PROVIDER="google"
-VERTEX_PROJECT="your-gcp-project-id"
-VERTEX_LOCATION="us-central1"
-USE_VERTEX_AUTH=true
-# BIG_MODEL="gemini-2.5-pro" # Optional, it's the default for Google pref
-# SMALL_MODEL="gemini-2.5-flash" # Optional, it's the default for Google pref
-```
+The server validates `router.yaml` at startup and refuses to start if it's
+missing, malformed, has a model entry missing a required field, or if
+`preferredModel`/a tier override references an `id` that doesn't exist.
 
-**Example 3: Use Direct Anthropic ("Just an Anthropic Proxy" Mode)**
-```dotenv
-ANTHROPIC_API_KEY="sk-ant-..."
-PREFERRED_PROVIDER="anthropic"
-# BIG_MODEL and SMALL_MODEL are ignored in this mode
-# haiku/sonnet requests are passed directly to Anthropic models
-```
-
-*Use case: This mode enables you to use the proxy infrastructure (for logging, middleware, request/response processing, etc.) while still using actual Anthropic models rather than being forced to remap to OpenAI or Gemini.*
-
-**Example 4: Use Specific OpenAI Models**
-```dotenv
-OPENAI_API_KEY="your-openai-key"
-GEMINI_API_KEY="your-google-key"
-PREFERRED_PROVIDER="openai"
-BIG_MODEL="gpt-4o" # Example specific model
-SMALL_MODEL="gpt-4o-mini" # Example specific model
-```
+**Discovering the current config:**
+- `GET /health` — the resolved default model, endpoint type, host, and model count.
+- `GET /v1/models` — the list of `id`s configured in `router.yaml`.
 
 ## How It Works 🧩
 
 This proxy works by:
 
 1. **Receiving requests** in Anthropic's API format 📥
-2. **Translating** the requests to OpenAI format via LiteLLM 🔄
-3. **Sending** the translated request to OpenAI 📤
-4. **Converting** the response back to Anthropic format 🔄
-5. **Returning** the formatted response to the client ✅
+2. **Resolving** the Claude tier (`haiku`/`sonnet`/`opus`) to a `router.yaml` model entry 🗺️
+3. **Translating** the request into LiteLLM/OpenAI shape, targeting that entry's provider 🔄
+4. **Sending** the translated request upstream 📤
+5. **Converting** the response back to Anthropic format, echoing the original Claude model id 🔄
+6. **Returning** the formatted response to the client ✅
 
 The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients. 🌊
 

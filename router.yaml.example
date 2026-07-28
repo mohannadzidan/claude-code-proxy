@@ -1,0 +1,44 @@
+# router.yaml
+#
+# Centralized model routing configuration. Copy this file to router.yaml
+# (git-ignored) and fill in your own models/keys. The server refuses to start
+# if router.yaml is missing or invalid.
+#
+# ${ENV_VAR} and ${ENV_VAR:-default_value} are interpolated from the process
+# environment (e.g. from .env) at load time, so secrets never need to be
+# committed here.
+
+# Required. The id of the default model to use for any tier that has no
+# tier-specific override below. Must match the `id` of an entry in `models`.
+preferredModel: minimax/minimax-m3
+
+# Optional per-tier overrides. Each falls back to `preferredModel` if unset.
+# preferredModelHaiku: openai/gpt-4.1-mini
+# preferredModelSonnet: minimax/minimax-m3
+# preferredModelOpus: anthropic/claude-opus-4-20250514
+
+models:
+  # LiteLLM canonical id (`id`) is what preferredModel/preferredModelHaiku/etc.
+  # reference. `providerModelName` is the exact string sent to the upstream
+  # API -- these can differ when a gateway uses a non-standard model name.
+  - id: minimax/minimax-m3
+    providerModelName: minimaxai/minimax-m3
+    endpointType: openai # openai | anthropic | gemini
+    providerBaseUrl: https://api.example.com/v1 # empty/omitted = provider default
+    providerApiKey: ${MINIMAX_API_KEY}
+    displayName: "MiniMax M3"
+
+  - id: openai/gpt-4.1
+    providerModelName: gpt-4.1
+    endpointType: openai
+    providerApiKey: ${OPENAI_API_KEY}
+
+  - id: gemini-2.5-pro
+    providerModelName: gemini-2.5-pro
+    endpointType: gemini
+    providerApiKey: ${GEMINI_API_KEY}
+
+  - id: anthropic/claude-opus-4-20250514
+    providerModelName: claude-opus-4-20250514
+    endpointType: anthropic
+    providerApiKey: ${ANTHROPIC_API_KEY}

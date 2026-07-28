@@ -1,6 +1,9 @@
 # Environment variables
 .env
 
+# Router configuration (contains API keys / endpoint URLs)
+router.yaml
+
 # Python
 __pycache__/
 *.py[cod]

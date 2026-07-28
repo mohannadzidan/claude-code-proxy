@@ -13,5 +13,6 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "google-auth>=2.41.1",
     "google-cloud-aiplatform>=1.120.0",
+    "pyyaml>=6.0",
 ]
 

@@ -416,8 +416,61 @@ logger.warning(
 )
 
 
-def getModel(tier: Optional[Literal["haiku", "sonnet", "opus"]] = None) -> ResolvedModel:
-    """Resolve a Claude tier onto its configured upstream model."""
+def _discovery_model_id(entry_id: str) -> str:
+    """Id Claude Code's gateway model discovery will actually surface.
+
+    Claude Code's /v1/models picker (enabled client-side with
+    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) ignores any discovered id
+    that doesn't start with "claude" or "anthropic", so router.yaml ids like
+    "glm-5.2" need a "claude-" prefix to show up as selectable entries.
+    """
+    lowered = entry_id.lower()
+    if lowered.startswith("claude") or lowered.startswith("anthropic"):
+        return entry_id
+    return f"claude-{entry_id}"
+
+
+def _resolve_entry(entry: ModelEntry) -> ResolvedModel:
+    return ResolvedModel(
+        id=entry.id,
+        providerModelName=entry.providerModelName,
+        endpointType=entry.endpointType,
+        providerApiKey=entry.providerApiKey,
+        providerBaseUrl=entry.providerBaseUrl,
+        displayName=entry.displayName,
+        disable_reasoning=entry.disable_reasoning,
+    )
+
+
+def _find_entry_by_client_model(model_str: Optional[str]) -> Optional[ModelEntry]:
+    """Match a client-sent `model` string directly against a router.yaml id.
+
+    Lets users pick a specific router.yaml model from Claude Code's `/model`
+    picker (via gateway model discovery, see _discovery_model_id) instead of
+    only ever landing on one of the haiku/sonnet/opus tier mappings.
+    """
+    if not model_str:
+        return None
+    for entry in ROUTER_CONFIG.models:
+        if model_str in (entry.id, _discovery_model_id(entry.id)):
+            return entry
+    return None
+
+
+def getModel(
+    tier: Optional[Literal["haiku", "sonnet", "opus"]] = None,
+    direct_model: Optional[str] = None,
+) -> ResolvedModel:
+    """Resolve a request onto its configured upstream model.
+
+    A `direct_model` that names a router.yaml id (or its discovery-prefixed
+    form) wins outright; otherwise falls back to the haiku/sonnet/opus tier
+    mapping.
+    """
+    direct_entry = _find_entry_by_client_model(direct_model)
+    if direct_entry is not None:
+        return _resolve_entry(direct_entry)
+
     if tier == "haiku":
         target_id = ROUTER_CONFIG.preferredModelHaiku or ROUTER_CONFIG.preferredModel
     elif tier == "sonnet":
@@ -429,15 +482,7 @@ def getModel(tier: Optional[Literal["haiku", "sonnet", "opus"]] = None) -> Resol
 
     for entry in ROUTER_CONFIG.models:
         if entry.id == target_id:
-            return ResolvedModel(
-                id=entry.id,
-                providerModelName=entry.providerModelName,
-                endpointType=entry.endpointType,
-                providerApiKey=entry.providerApiKey,
-                providerBaseUrl=entry.providerBaseUrl,
-                displayName=entry.displayName,
-                disable_reasoning=entry.disable_reasoning,
-            )
+            return _resolve_entry(entry)
 
     # Startup validation guarantees every preferred* id resolves; this only
     # triggers if router.yaml is mutated after the process started.
@@ -939,7 +984,7 @@ def _normalize_openai_content(parts: List[Dict[str, Any]]) -> Union[str, List[Di
     """
     if not parts:
         return None
-    if all(p.get("type") == "text" for p in parts):
+    if all(p.get("type") == "text" and "cache_control" not in p for p in parts):
         text = "\n".join(p.get("text", "") for p in parts if p.get("text"))
         return text
     return parts
@@ -1014,6 +1059,12 @@ def convert_anthropic_to_litellm(
 
     # ---------- system ----------
     system_text = ""
+    # Only collected/forwarded for is_anthropic_model: cache_control is an
+    # Anthropic-specific field litellm's Anthropic transform reads directly off
+    # each system content block. Sending it to an OpenAI-compatible backend
+    # would just be an unrecognized field, so plain OpenAI-shape backends keep
+    # getting the flattened system_text string as before.
+    system_blocks: List[Dict[str, Any]] = []
     if anthropic_request.system:
         if isinstance(anthropic_request.system, str):
             system_text = anthropic_request.system
@@ -1021,7 +1072,16 @@ def convert_anthropic_to_litellm(
             parts = []
             for block in anthropic_request.system:
                 if _block_get(block, "type") == "text":
-                    parts.append(_block_get(block, "text", "") or "")
+                    text = _block_get(block, "text", "") or ""
+                    if not text:
+                        continue
+                    parts.append(text)
+                    if is_anthropic_model:
+                        block_dict = {"type": "text", "text": text}
+                        cache_control = _block_get(block, "cache_control")
+                        if cache_control is not None:
+                            block_dict["cache_control"] = cache_control
+                        system_blocks.append(block_dict)
             system_text = "\n\n".join(p for p in parts if p)
 
     system_role = _system_role_for(target_model)
@@ -1031,7 +1091,9 @@ def convert_anthropic_to_litellm(
             # Fold into the first user turn for models with no system role.
             pending_system_prefix = system_text.strip() + "\n\n"
         else:
-            messages.append({"role": system_role, "content": system_text.strip()})
+            has_cache_control = any("cache_control" in b for b in system_blocks)
+            content = system_blocks if has_cache_control else system_text.strip()
+            messages.append({"role": system_role, "content": content})
 
     # ---------- conversation ----------
     # Track which tool_use ids the assistant actually emitted. OpenAI returns a hard
@@ -1062,7 +1124,12 @@ def convert_anthropic_to_litellm(
                 if btype == "text":
                     t = _block_get(block, "text", "") or ""
                     if t:
-                        text_parts.append({"type": "text", "text": t})
+                        part = {"type": "text", "text": t}
+                        if is_anthropic_model:
+                            cache_control = _block_get(block, "cache_control")
+                            if cache_control is not None:
+                                part["cache_control"] = cache_control
+                        text_parts.append(part)
                 elif btype == "tool_use":
                     tool_id = _block_get(block, "id") or f"call_{uuid.uuid4().hex[:24]}"
                     tool_input = _block_get(block, "input", {})
@@ -1112,13 +1179,18 @@ def convert_anthropic_to_litellm(
                     result_text = "(no output)"
                 if tool_use_id and tool_use_id in announced_tool_ids:
                     satisfied_tool_ids.add(tool_use_id)
-                    tool_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_use_id,
-                            "content": result_text,
-                        }
-                    )
+                    tool_msg = {
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": result_text,
+                    }
+                    if is_anthropic_model:
+                        # litellm's Anthropic transform reads cache_control off the
+                        # tool message itself (not nested in content) for role:"tool".
+                        cache_control = _block_get(block, "cache_control")
+                        if cache_control is not None:
+                            tool_msg["cache_control"] = cache_control
+                    tool_messages.append(tool_msg)
                 else:
                     # Orphaned result (no matching call in this window, e.g. after
                     # client-side history truncation). Demote to user text rather
@@ -1132,7 +1204,12 @@ def convert_anthropic_to_litellm(
             elif btype == "text":
                 t = _block_get(block, "text", "") or ""
                 if t:
-                    user_parts.append({"type": "text", "text": t})
+                    part = {"type": "text", "text": t}
+                    if is_anthropic_model:
+                        cache_control = _block_get(block, "cache_control")
+                        if cache_control is not None:
+                            part["cache_control"] = cache_control
+                    user_parts.append(part)
             elif btype == "image":
                 part = _anthropic_image_to_openai(_block_get(block, "source"))
                 if part:
@@ -1271,16 +1348,20 @@ def convert_anthropic_to_litellm(
             else:
                 input_schema = _sanitize_json_schema_for_openai(input_schema)
 
-            openai_tools.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": tool_dict.get("description", "") or "",
-                        "parameters": input_schema,
-                    },
-                }
-            )
+            openai_tool: Dict[str, Any] = {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool_dict.get("description", "") or "",
+                    "parameters": input_schema,
+                },
+            }
+            if is_anthropic_model and tool_dict.get("cache_control") is not None:
+                # Claude Code marks the *last* tool with cache_control to cache the
+                # whole tool-definitions prefix. litellm's Anthropic transform reads
+                # this off the tool entry itself, not nested under "function".
+                openai_tool["cache_control"] = tool_dict["cache_control"]
+            openai_tools.append(openai_tool)
         if openai_tools:
             litellm_request["tools"] = openai_tools
 
@@ -2286,7 +2367,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         if "/" in display_model:
             display_model = display_model.split("/")[-1]
 
-        resolved = getModel(request.model_tier)
+        resolved = getModel(request.model_tier, request.original_model or request.model)
         logger.debug(
             f"📌 MODEL ROUTING: tier={request.model_tier!r} -> id={resolved.id!r} "
             f"(provider={resolved.litellm_provider}, upstream={resolved.providerModelName!r})"
@@ -2436,7 +2517,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             status_code = 500
 
         try:
-            error_resolved = getModel(request.model_tier)
+            error_resolved = getModel(request.model_tier, request.original_model or request.model)
             error_resolved_display = error_resolved.displayName or error_resolved.id
         except Exception:
             error_resolved_display = request.model
@@ -2477,7 +2558,7 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         if "/" in display_model:
             display_model = display_model.split("/")[-1]
 
-        resolved = getModel(request.model_tier)
+        resolved = getModel(request.model_tier, request.original_model or request.model)
         resolved_display = resolved.displayName or resolved.id
 
         # Convert the messages to a format LiteLLM can understand
@@ -2623,20 +2704,31 @@ async def health():
 
 @app.get("/v1/models")
 async def list_models():
-    """Model ids configured in router.yaml; clients probe this to discover choices."""
-    ids: List[str] = []
+    """Model ids configured in router.yaml.
+
+    Ids are exposed under their discovery-prefixed form (see
+    _discovery_model_id) so Claude Code's gateway model discovery
+    (CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) surfaces each one as a
+    directly selectable "From gateway" entry in `/model`, instead of only
+    ever landing on the haiku/sonnet/opus tier mapping. _find_entry_by_client_model
+    accepts either this prefixed id or the raw router.yaml id back.
+    """
+    seen: set = set()
+    entries = []
     for entry in ROUTER_CONFIG.models:
-        if entry.id not in ids:
-            ids.append(entry.id)
+        if entry.id in seen:
+            continue
+        seen.add(entry.id)
+        entries.append(entry)
     return {
         "data": [
             {
-                "id": mid,
+                "id": _discovery_model_id(entry.id),
                 "type": "model",
-                "display_name": mid,
+                "display_name": entry.displayName or entry.id,
                 "created_at": "2025-01-01T00:00:00Z",
             }
-            for mid in ids
+            for entry in entries
         ],
         "has_more": False,
     }

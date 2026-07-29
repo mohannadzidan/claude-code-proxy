@@ -174,6 +174,26 @@ missing, malformed, has a model entry missing a required field, or if
 - `GET /health` — the resolved default model, endpoint type, host, and model count.
 - `GET /v1/models` — the list of `id`s configured in `router.yaml`.
 
+### Picking a model directly instead of haiku/sonnet/opus
+
+Claude Code can list every `router.yaml` model as its own entry in the
+`/model` picker, instead of only ever landing on whichever backend the
+haiku/sonnet/opus tier happens to map to. Enable it client-side:
+
+```bash
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 ANTHROPIC_BASE_URL=http://localhost:8082 claude
+```
+
+Claude Code only shows discovered ids that start with `claude` or
+`anthropic` ([gateway protocol reference](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)),
+so `GET /v1/models` reports each `router.yaml` id under a `claude-`-prefixed
+alias (e.g. `glm-5.2` → `claude-glm-5.2`; an id already starting with
+`claude`/`anthropic` is left as-is). Picking one of these in `/model` sends
+that alias back as the `model` field, and the proxy resolves it straight to
+the matching entry, bypassing tier mapping entirely. The haiku/sonnet/opus
+tiers keep working unchanged for any model string that doesn't match a
+discovered alias.
+
 ## How It Works 🧩
 
 This proxy works by:

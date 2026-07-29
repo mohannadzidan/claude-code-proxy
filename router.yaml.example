@@ -27,6 +27,14 @@ models:
     providerBaseUrl: https://api.example.com/v1 # empty/omitted = provider default
     providerApiKey: ${MINIMAX_API_KEY}
     displayName: "MiniMax M3"
+    # Optional. Reasoning-capable OpenAI-compatible models (glm, minimax,
+    # nemotron, ...) aren't recognized by the server's built-in reasoning-model
+    # name pattern (which only matches o1-o4/gpt-5/deepseek-r/qwq/grok-reasoning),
+    # so `thinking` requests from the client would otherwise never be forwarded
+    # as `reasoning_effort`, and the model would never be asked to think at
+    # all. Set true here to force it on regardless of model name, or false to
+    # force it off even if the name happens to match.
+    reasoning: true
 
   - id: openai/gpt-4.1
     providerModelName: gpt-4.1

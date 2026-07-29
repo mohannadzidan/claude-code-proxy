@@ -131,10 +131,12 @@ preferredModelOpus: anthropic/claude-opus-4-20250514
 models:
   - id: minimax/minimax-m3              # LiteLLM routing id (lookup key)
     providerModelName: minimaxai/minimax-m3  # exact string sent upstream
-    endpointType: openai                # openai | anthropic | gemini
+    endpointType: openai                 # openai | anthropic | gemini
     providerBaseUrl: https://api.example.com/v1  # empty/omitted = provider default
     providerApiKey: ${MINIMAX_API_KEY}  # supports ${VAR} / ${VAR:-default}
     displayName: "MiniMax M3"           # optional, logging/health only
+    reasoning: true                     # forces reasoning_effort for models
+                                         # the built-in name pattern misses
 ```
 
 `id` and `providerModelName` are deliberately separate: some upstream gateways
@@ -143,6 +145,18 @@ route internally as a different provider (`minimax/minimax-m3`). `id` is only
 ever used for lookup within this proxy; `providerModelName` is the literal
 string sent to the upstream API, and `endpointType` tells LiteLLM which
 protocol/provider to speak.
+
+`endpointType: openai` covers both the real OpenAI API and any third-party
+OpenAI-compatible gateway (vLLM, SGLang, NVIDIA NIM, aggregators like
+agentrouter...) — you never need to distinguish them in router.yaml. Under the
+hood, the proxy auto-detects non-OpenAI base URLs and routes those through
+LiteLLM's `hosted_vllm` provider instead of `openai`, because LiteLLM's plain
+`openai` provider silently drops streamed reasoning traces for third-party
+gateways: any SSE chunk that carries only `reasoning_content` (no `content`)
+gets treated as empty and discarded, so extended-thinking output vanishes
+mid-stream even though the upstream bytes clearly contain it. `hosted_vllm`
+handles the identical request/response shape but has a working
+reasoning_content path in streaming. This is invisible from router.yaml.
 
 The server validates `router.yaml` at startup and refuses to start if it's
 missing, malformed, has a model entry missing a required field, or if

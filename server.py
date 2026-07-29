@@ -200,7 +200,44 @@ class RouterConfigError(Exception):
     """Raised when router.yaml is missing, malformed, or fails validation."""
 
 
-VALID_ENDPOINT_TYPES = {"openai", "anthropic", "gemini"}
+# "hosted_vllm" is litellm's provider type for self-hosted/third-party
+# OpenAI-compatible inference servers (vLLM, SGLang, NVIDIA NIM, ...). It is
+# not meant to be written in router.yaml -- see _effective_custom_llm_provider
+# below, which upgrades "openai" entries to it automatically based on
+# providerBaseUrl. Kept in this set only as an explicit-override escape hatch.
+VALID_ENDPOINT_TYPES = {"openai", "hosted_vllm", "anthropic", "gemini"}
+
+# Real OpenAI API hosts; anything else behind endpointType: openai is a
+# third-party OpenAI-compatible gateway.
+_REAL_OPENAI_HOSTS = {"api.openai.com"}
+
+
+def _effective_custom_llm_provider(resolved: "ResolvedModel") -> str:
+    """Pick the litellm custom_llm_provider actually sent upstream.
+
+    router.yaml's `endpointType: openai` is meant to cover both the real
+    OpenAI API and any third-party OpenAI-compatible gateway (vLLM, SGLang,
+    NVIDIA NIM, aggregators like agentrouter...). litellm's plain "openai"
+    provider silently drops streamed reasoning traces for the latter: any SSE
+    delta that carries only `reasoning_content` (no `content`) is treated as
+    an empty chunk and discarded, so extended-thinking output vanishes
+    mid-stream even though the upstream bytes clearly contain it (confirmed
+    directly against NVIDIA NIM). litellm's "hosted_vllm" provider handles the
+    identical request/response shape but has a working reasoning_content path.
+
+    Auto-upgrade "openai" to "hosted_vllm" whenever providerBaseUrl isn't
+    actually OpenAI's, so router.yaml authors never need to know this litellm
+    quirk exists. An explicit `endpointType: hosted_vllm` always wins.
+    """
+    if resolved.endpointType != "openai":
+        return resolved.endpointType
+    if not resolved.providerBaseUrl:
+        # No override -> litellm's own default api_base, which is OpenAI's.
+        return "openai"
+    host = urlparse(resolved.providerBaseUrl).netloc.lower().split(":")[0]
+    if host in _REAL_OPENAI_HOSTS or host.endswith(".openai.com"):
+        return "openai"
+    return "hosted_vllm"
 REQUIRED_MODEL_FIELDS = ("id", "providerModelName", "endpointType", "providerApiKey")
 
 # ${ENV_VAR} or ${ENV_VAR:-default_value}
@@ -239,6 +276,10 @@ class ModelEntry:
     providerApiKey: str
     providerBaseUrl: Optional[str] = None
     displayName: Optional[str] = None
+    # Explicit override for reasoning-capable OpenAI-compatible models (glm,
+    # minimax, nemotron, ...) that REASONING_MODEL_PATTERN's name-based
+    # whitelist doesn't recognise. None means "fall back to the pattern".
+    reasoning: Optional[bool] = None
 
 
 @dataclass
@@ -249,6 +290,7 @@ class ResolvedModel:
     providerApiKey: str
     providerBaseUrl: Optional[str] = None
     displayName: Optional[str] = None
+    reasoning: Optional[bool] = None
 
     @property
     def litellm_model(self) -> str:
@@ -298,6 +340,7 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
                 f"(must be one of {sorted(VALID_ENDPOINT_TYPES)})"
             )
 
+        raw_reasoning = entry.get("reasoning")
         models.append(
             ModelEntry(
                 id=entry["id"],
@@ -306,6 +349,7 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
                 providerApiKey=entry["providerApiKey"],
                 providerBaseUrl=entry.get("providerBaseUrl") or None,
                 displayName=entry.get("displayName") or None,
+                reasoning=bool(raw_reasoning) if raw_reasoning is not None else None,
             )
         )
         ids_seen.add(entry["id"])
@@ -387,6 +431,7 @@ def getModel(tier: Optional[Literal["haiku", "sonnet", "opus"]] = None) -> Resol
                 providerApiKey=entry.providerApiKey,
                 providerBaseUrl=entry.providerBaseUrl,
                 displayName=entry.displayName,
+                reasoning=entry.reasoning,
             )
 
     # Startup validation guarantees every preferred* id resolves; this only
@@ -482,6 +527,22 @@ def strip_provider_prefix(model: str) -> str:
 def is_reasoning_model(model: str) -> bool:
     """True for models that use the restricted reasoning-model parameter set."""
     return bool(REASONING_MODEL_PATTERN.match(strip_provider_prefix(model)))
+
+
+def supports_reasoning_effort(resolved: "ResolvedModel") -> bool:
+    """True when `reasoning_effort` should be forwarded for this upstream model.
+
+    REASONING_MODEL_PATTERN only recognises OpenAI's own reasoning-model
+    naming (o1-o4, gpt-5, ...). Reasoning-capable models served through
+    OpenAI-compatible gateways (glm, minimax, nemotron, ...) don't match that
+    pattern and never got `reasoning_effort`, so they silently never reasoned
+    even when the client asked for extended thinking. router.yaml's
+    `reasoning: true/false` on a model entry overrides the pattern; when unset
+    the pattern is the fallback.
+    """
+    if resolved.reasoning is not None:
+        return resolved.reasoning
+    return is_reasoning_model(resolved.litellm_model)
 
 
 def supports_temperature(model: str) -> bool:
@@ -1107,10 +1168,14 @@ def convert_anthropic_to_litellm(
 
     litellm_request: Dict[str, Any] = {
         "model": target_model,
-        "custom_llm_provider": resolved.litellm_provider,
+        "custom_llm_provider": _effective_custom_llm_provider(resolved),
         "api_key": resolved.providerApiKey,
         "messages": messages,
         "stream": bool(anthropic_request.stream),
+        # Anthropic-only fields (e.g. `thinking`) that leak through to a
+        # non-Anthropic target must be dropped by litellm rather than sent
+        # upstream as unknown params and rejected by the gateway.
+        "drop_params": True,
     }
     if resolved.providerBaseUrl:
         litellm_request["api_base"] = resolved.providerBaseUrl
@@ -1146,7 +1211,7 @@ def convert_anthropic_to_litellm(
             if anthropic_request.thinking.budget_tokens:
                 thinking_payload["budget_tokens"] = anthropic_request.thinking.budget_tokens
             litellm_request["thinking"] = thinking_payload
-        elif is_reasoning_model(target_model):
+        elif supports_reasoning_effort(resolved):
             budget = anthropic_request.thinking.budget_tokens or 0
             if budget and budget <= 4096:
                 litellm_request["reasoning_effort"] = "low"

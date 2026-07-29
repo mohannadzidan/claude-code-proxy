@@ -140,6 +140,8 @@ models:
     reasoning_effort_map:                # optional, remap Claude's /effort
       xhigh: high                        # levels this model/gateway rejects
       max: high
+    requestHeaders:                      # optional, extra headers for just
+      x-gateway-route: opus-pool         # this model (any endpointType)
 ```
 
 `id` and `providerModelName` are deliberately separate: some upstream gateways
@@ -168,6 +170,23 @@ reasoning-capable even though their name doesn't match the server's built-in
 reasoning-model pattern (`o1-o4`/`gpt-5`/`deepseek-r`/`qwq`/`grok-reasoning`).
 Set `disable_reasoning: true` on an entry for a genuinely non-reasoning model
 (e.g. `gpt-4.1`) that should just ignore thinking requests instead.
+
+### `endpointType: anthropic` is a transparent passthrough
+
+Unlike `openai`/`hosted_vllm`/`gemini` entries, an `endpointType: anthropic`
+model skips the OpenAI-shaped translation pipeline entirely for `/v1/messages`:
+the client's request body and headers are forwarded to the configured backend
+essentially untouched, and its response (including the raw SSE stream) is
+relayed back the same way. The proxy only patches two things: the `model`
+field in the response (so a tier can still resolve to a different specific
+upstream model id than the client asked for, while Claude Code still sees the
+model name it originally sent) and, if configured, `reasoning_effort_map`'s
+remapping of `output_config.effort`. This exists because a real
+Anthropic-compatible backend already speaks Claude Code's exact
+wire format, so round-tripping through OpenAI shape and back only risks losing
+fidelity (thinking blocks, `cache_control`, tool_use shape, `stop_reason`, ...)
+for no benefit. `DUMP_EVENTS` logging still applies; it's the only
+interception on this path.
 
 ### Mapping Claude's `/effort` levels per model
 
@@ -210,6 +229,28 @@ proxy-side clamping; if you're on a litellm version/backend that already
 accepts these values, leave the map unset and effort levels flow through
 verbatim.
 
+### Per-model header overrides
+
+`requestHeaders` on a model entry adds/overrides headers sent upstream for
+that model only, regardless of `endpointType`:
+
+```yaml
+models:
+  - id: minimax/minimax-m3
+    providerModelName: minimaxai/minimax-m3
+    endpointType: openai
+    providerApiKey: ${MINIMAX_API_KEY}
+    requestHeaders:
+      x-gateway-route: pool-a
+```
+
+For `endpointType: anthropic` this layers on top of the forwarded client
+headers; for the other endpoint types it's added to the request LiteLLM sends
+upstream. Precedence is: forwarded/default headers < `requestHeaders` <
+`CUSTOM_HEADER_<NAME>` env vars (see below) — a global `CUSTOM_HEADER_*` always
+wins if it sets the same header name, so it stays the one true override
+regardless of what any individual model configures.
+
 The server validates `router.yaml` at startup and refuses to start if it's
 missing, malformed, has a model entry missing a required field, or if
 `preferredModel`/a tier override references an `id` that doesn't exist.
@@ -247,9 +288,9 @@ with sane defaults if none are set.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LOG_LEVEL` | `WARN` | This proxy's own log verbosity. `DEBUG` surfaces model-mapping, stop_reason corrections, and tool-block diagnostics. |
+| `LOG_LEVEL` | `INFO` | This proxy's own log verbosity. At the default `INFO`, startup config (router.yaml load, custom headers) and `DUMP_EVENTS` traffic dumps are visible as soon as `DUMP_EVENTS` is set — no need to also raise the log level. `DEBUG` additionally surfaces model-mapping, stop_reason corrections, and tool-block diagnostics. `WARNING` silences everything except actual anomalies (dropped tools/messages, malformed tool-call JSON, empty completions, request validation failures). |
 | `LITELLM_LOG_LEVEL` | `WARNING` | LiteLLM's internal logger verbosity, kept separate so `LOG_LEVEL=DEBUG` shows *this proxy's* diagnostics without being buried under LiteLLM's own (often harmless) traceback noise. |
-| `DUMP_EVENTS` | `none` | Which side of the translation to log: `claude` (the Claude Code ↔ proxy conversation, both directions, in Anthropic shape), `upstream` (the proxy ↔ upstream conversation, both directions, in OpenAI/litellm shape), `all` (both), or `none`. An unrecognized value logs a warning and falls back to `upstream`. |
+| `DUMP_EVENTS` | `none` | Which side of the translation to log: `claude` (the Claude Code ↔ proxy conversation, both directions, in Anthropic shape), `upstream` (the proxy ↔ upstream conversation, both directions, in OpenAI/litellm shape), `all` (both), or `none`. An unrecognized value logs a warning and falls back to `upstream`. Logged at `INFO`, colorized (dimmed timestamp, per-level color, dimmed `CLAUDE`/`UPSTREAM` tags, and a bold green/yellow `→`/`←` arrow showing which way data is moving relative to the proxy). |
 | `MAX_TOKENS_LIMIT` | unset (no cap) | Hard ceiling on `max_tokens`/`max_completion_tokens` sent upstream, regardless of what the client requested. Set this only if a specific gateway needs one — the proxy otherwise passes the client's value through unchanged. |
 | `STREAM_KEEPALIVE_SECONDS` | `3` | Seconds of silence mid-stream before the proxy emits an Anthropic `ping` event, so clients don't drop the connection while a large tool-call payload is buffered. `0` disables. |
 | `UPSTREAM_IDLE_TIMEOUT` | `90` | Seconds to wait for any data from the upstream before aborting the request. Guards against a gateway that returns `200` and then never streams a body. `0` disables. |
@@ -257,7 +298,7 @@ with sane defaults if none are set.
 | `DISABLE_STREAM_OPTIONS` | `false` | Don't send `stream_options: {include_usage: true}`. Needed for OpenAI-compatible gateways that reject the field outright; without it, streamed responses report `output_tokens: 0` and Claude Code's context meter never moves. |
 | `ENABLE_CONTENT_REPLACEMENTS` | `false` | Enables text-rewriting passes on request/response content. Off by default because it's destructive for a coding agent (it can rewrite source code, file paths, and tool output). |
 | `PRESERVE_UPSTREAM_TOOL_IDS` | `false` | Use the backend's own `tool_use` id verbatim instead of the proxy's synthesized one. Leave this off for backends (e.g. Kimi) that derive ids from tool name + position and repeat them across turns — Anthropic requires ids to be unique per conversation, and a repeat is reported as an interrupted tool call. |
-| `CUSTOM_HEADER_<NAME>` | none | Any number of these inject a literal header on the upstream request. `<NAME>` is upper/underscore, lowercased and hyphenated to form the header name — e.g. `CUSTOM_HEADER_USER_AGENT=opencode` sends `user-agent: opencode`. Headers are also echoed back on the response to the client, except protocol-owned ones (`content-type` and similar) where doing so would break SSE streaming — the startup log states which of your configured headers fall into each group. |
+| `CUSTOM_HEADER_<NAME>` | none | Any number of these inject a literal header on the upstream request, for every model regardless of `router.yaml`'s per-model `requestHeaders`. `<NAME>` is upper/underscore, lowercased and hyphenated to form the header name — e.g. `CUSTOM_HEADER_USER_AGENT=opencode` sends `user-agent: opencode`. Always wins over a model's own `requestHeaders` if both set the same header. Headers are also echoed back on the response to the client, except protocol-owned ones (`content-type` and similar) where doing so would break SSE streaming — the startup log states which of your configured headers fall into each group. |
 
 Reasoning-related behavior (whether a model is asked to reason at all, and how
 Claude Code's `/effort` levels map onto it) is controlled per-model in
@@ -276,6 +317,9 @@ This proxy works by:
 4. **Sending** the translated request upstream 📤
 5. **Converting** the response back to Anthropic format, echoing the original Claude model id 🔄
 6. **Returning** the formatted response to the client ✅
+
+For `endpointType: anthropic` entries, steps 3 and 5 are skipped — see
+[`endpointType: anthropic` is a transparent passthrough](#endpointtype-anthropic-is-a-transparent-passthrough).
 
 The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients. 🌊
 

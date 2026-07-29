@@ -66,3 +66,12 @@ models:
     reasoning_effort_map:
       xhigh: high
       max: high
+
+    # Optional. Extra headers sent upstream for this model only, on top of
+    # whatever the proxy would normally send (forwarded client headers for
+    # endpointType: anthropic, or litellm's own headers otherwise). Useful for
+    # a gateway that routes on a header rather than the model name, or that
+    # needs some other per-model credential/tag. A CUSTOM_HEADER_* env var
+    # still wins if it sets the same header name.
+    requestHeaders:
+      x-gateway-route: opus-pool

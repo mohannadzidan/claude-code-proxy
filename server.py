@@ -313,6 +313,12 @@ class ModelEntry:
     # "high"} for a backend that only understands the classic 3-tier scale.
     # Unmapped levels pass through unchanged; unset means no remapping at all.
     reasoning_effort_map: Optional[Dict[str, str]] = None
+    # Optional per-model header overrides sent upstream for this model only
+    # (e.g. a gateway that routes on a header rather than the model name).
+    # Applies to every endpointType. Precedence for the outgoing request is
+    # forwarded/default headers < requestHeaders < CUSTOM_HEADER_* env vars,
+    # so a global CUSTOM_HEADER_* still wins if both set the same header.
+    requestHeaders: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -325,6 +331,7 @@ class ResolvedModel:
     displayName: Optional[str] = None
     disable_reasoning: Optional[bool] = None
     reasoning_effort_map: Optional[Dict[str, str]] = None
+    requestHeaders: Optional[Dict[str, str]] = None
 
     @property
     def litellm_model(self) -> str:
@@ -383,6 +390,16 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
                 raise RouterConfigError(
                     f"Entry {idx}: 'reasoning_effort_map' must be a mapping of string to string"
                 )
+
+        raw_request_headers = entry.get("requestHeaders")
+        if raw_request_headers is not None:
+            if not isinstance(raw_request_headers, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in raw_request_headers.items()
+            ):
+                raise RouterConfigError(
+                    f"Entry {idx}: 'requestHeaders' must be a mapping of string to string"
+                )
+
         models.append(
             ModelEntry(
                 id=entry["id"],
@@ -395,6 +412,7 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
                     bool(raw_disable_reasoning) if raw_disable_reasoning is not None else None
                 ),
                 reasoning_effort_map=raw_effort_map,
+                requestHeaders=raw_request_headers,
             )
         )
         ids_seen.add(entry["id"])
@@ -480,6 +498,7 @@ def _resolve_entry(entry: ModelEntry) -> ResolvedModel:
         displayName=entry.displayName,
         disable_reasoning=entry.disable_reasoning,
         reasoning_effort_map=entry.reasoning_effort_map,
+        requestHeaders=entry.requestHeaders,
     )
 
 
@@ -1394,8 +1413,13 @@ def convert_anthropic_to_litellm(
         if isinstance(user_id, str) and user_id:
             litellm_request["user"] = user_id[:128]
 
+    extra_headers = {}
+    if resolved.requestHeaders:
+        extra_headers.update(resolved.requestHeaders)
     if CUSTOM_HEADERS:
-        litellm_request["extra_headers"] = dict(CUSTOM_HEADERS)
+        extra_headers.update(CUSTOM_HEADERS)
+    if extra_headers:
+        litellm_request["extra_headers"] = extra_headers
 
     # ---------- tools ----------
     if anthropic_request.tools:
@@ -2469,6 +2493,8 @@ def _anthropic_passthrough_headers(raw_request: Request, resolved: ResolvedModel
     }
     headers["x-api-key"] = resolved.providerApiKey
     headers.setdefault("anthropic-version", "2023-06-01")
+    if resolved.requestHeaders:
+        headers.update(resolved.requestHeaders)
     headers.update(CUSTOM_HEADERS)
     return headers
 

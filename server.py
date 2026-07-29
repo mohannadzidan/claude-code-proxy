@@ -2436,6 +2436,226 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         yield "data: [DONE]\n\n"
 
 
+# Real default for endpointType: anthropic when router.yaml leaves
+# providerBaseUrl unset.
+ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+
+# Headers that must not be forwarded verbatim: framing/hop-by-hop headers tied
+# to the client<->proxy connection (not the proxy<->upstream one), and auth,
+# which gets replaced with the key configured for this upstream in router.yaml.
+_ANTHROPIC_PASSTHROUGH_STRIP_HEADERS = {
+    "host",
+    "content-length",
+    "connection",
+    "transfer-encoding",
+    "x-api-key",
+    "authorization",
+}
+
+
+def _anthropic_passthrough_headers(raw_request: Request, resolved: ResolvedModel) -> Dict[str, str]:
+    """Headers for a transparent /v1/messages call to a real Anthropic-compatible backend.
+
+    Forwards every header the client sent as-is -- anthropic-version,
+    anthropic-beta, user-agent, x-stainless-*, whatever Claude Code sends next
+    year with no proxy change needed -- except the handful that must change
+    because the destination (and possibly the body) differs, and auth, which
+    is replaced with the key configured for this upstream in router.yaml.
+    """
+    headers = {
+        k: v for k, v in raw_request.headers.items()
+        if k.lower() not in _ANTHROPIC_PASSTHROUGH_STRIP_HEADERS
+    }
+    headers["x-api-key"] = resolved.providerApiKey
+    headers.setdefault("anthropic-version", "2023-06-01")
+    headers.update(CUSTOM_HEADERS)
+    return headers
+
+
+def _anthropic_passthrough_response_headers(resp: httpx.Response) -> Dict[str, str]:
+    """Upstream response headers to relay back to the client as-is (rate-limit
+    counters, request-id, ...), excluding the ones FastAPI/Starlette must own
+    (content-type/length, framing) -- see RESPONSE_PROTECTED_HEADERS."""
+    return {
+        k: v for k, v in resp.headers.items()
+        if k.lower() not in RESPONSE_PROTECTED_HEADERS
+    }
+
+
+def _apply_content_replacements_to_system(system: Any) -> Any:
+    """Same rewrite apply_content_replacements does for messages, for Anthropic's
+    separate top-level `system` field (which the OpenAI-shaped pipeline folds
+    into the messages list, but the passthrough path forwards as-is)."""
+    if not ENABLE_CONTENT_REPLACEMENTS:
+        return system
+    if isinstance(system, str):
+        for pattern, replacement in CONTENT_REPLACEMENTS:
+            system = pattern.sub(replacement, system)
+        return system
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                for pattern, replacement in CONTENT_REPLACEMENTS:
+                    text = pattern.sub(replacement, text)
+                block["text"] = text
+    return system
+
+
+def _patch_message_start_model(event_bytes: bytes, original_model: str) -> bytes:
+    """Rewrite the `model` field in a message_start SSE event to what the client
+    asked for. router.yaml can map a tier to a different specific upstream model
+    id than the client requested, and Claude Code checks this field against what
+    it sent -- everything else in the event stream passes through untouched."""
+    for line in event_bytes.split(b"\n"):
+        if line.startswith(b"data: "):
+            try:
+                payload = json.loads(line[len(b"data: "):])
+            except json.JSONDecodeError:
+                return event_bytes
+            if isinstance(payload.get("message"), dict):
+                payload["message"]["model"] = original_model
+                patched_line = b"data: " + json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                return event_bytes.replace(line, patched_line, 1)
+            return event_bytes
+    return event_bytes
+
+
+async def _stream_anthropic_passthrough(
+    client: httpx.AsyncClient, resp: httpx.Response, original_model: str
+):
+    """Relay a real Anthropic backend's SSE stream to the client byte-for-byte,
+    splitting only on event boundaries (blank lines) so each event can be
+    logged and the message_start model field patched. No other event is parsed
+    or altered."""
+    buf = b""
+    try:
+        async for chunk in _iter_with_idle_timeout(resp.aiter_bytes(), UPSTREAM_IDLE_TIMEOUT):
+            buf += chunk
+            while b"\n\n" in buf:
+                event, buf = buf.split(b"\n\n", 1)
+                event = _patch_message_start_model(event, original_model)
+                if DUMP_EVENTS_UPSTREAM:
+                    logger.info(f"UPSTREAM ← {event.decode('utf-8', 'replace')}")
+                yield event + b"\n\n"
+        if buf:
+            if DUMP_EVENTS_UPSTREAM:
+                logger.info(f"UPSTREAM ← {buf.decode('utf-8', 'replace')}")
+            yield buf
+    finally:
+        await resp.aclose()
+        await client.aclose()
+
+
+async def _anthropic_passthrough(
+    body_json: Dict[str, Any],
+    resolved: ResolvedModel,
+    request: "MessagesRequest",
+    raw_request: Request,
+    display_model: str,
+    resolved_display: str,
+):
+    """Forward an /v1/messages request straight to a real Anthropic-compatible
+    backend (router.yaml endpointType: anthropic) with no OpenAI-shape
+    round trip.
+
+    Those backends already speak the exact wire format Claude Code sends, so
+    routing them through convert_anthropic_to_litellm / convert_litellm_to_anthropic
+    only risks losing fidelity (thinking blocks, cache_control, tool_use shape,
+    stop_reason, ...) for no benefit. This patches only the two things the
+    router itself is responsible for -- `model` (tier -> configured upstream
+    id) and, if router.yaml sets reasoning_effort_map, `output_config.effort`
+    -- and otherwise sends the client's JSON straight through. DUMP_EVENTS
+    logging is the only other interception.
+    """
+    original_model = request.original_model or request.model
+
+    outgoing = dict(body_json)
+    outgoing["model"] = resolved.providerModelName
+    outgoing["messages"] = apply_content_replacements(list(outgoing.get("messages", [])))
+    if "system" in outgoing:
+        outgoing["system"] = _apply_content_replacements_to_system(outgoing["system"])
+
+    if resolved.reasoning_effort_map:
+        output_config = outgoing.get("output_config")
+        if isinstance(output_config, dict) and isinstance(output_config.get("effort"), str):
+            effort = output_config["effort"]
+            output_config["effort"] = resolved.reasoning_effort_map.get(effort, effort)
+
+    url = f"{(resolved.providerBaseUrl or ANTHROPIC_DEFAULT_BASE_URL).rstrip('/')}/v1/messages"
+    headers = _anthropic_passthrough_headers(raw_request, resolved)
+
+    if DUMP_EVENTS_UPSTREAM:
+        _dump = {
+            k: v for k, v in outgoing.items() if k not in ("messages", "tools", "system")
+        }
+        _dump["message_roles"] = [
+            m.get("role") for m in outgoing.get("messages", []) if isinstance(m, dict)
+        ]
+        logger.info(f"UPSTREAM → {json.dumps(_dump, ensure_ascii=False)}")
+
+    num_tools = len(outgoing.get("tools") or [])
+    num_messages = len(outgoing.get("messages") or [])
+    log_request_beautifully(
+        "POST", raw_request.url.path, display_model, resolved_display,
+        num_messages, num_tools, None,
+    )
+
+    timeout = httpx.Timeout(600.0, connect=30.0)
+
+    if outgoing.get("stream"):
+        client = httpx.AsyncClient(timeout=timeout)
+        req = client.build_request("POST", url, json=outgoing, headers=headers)
+        resp = await client.send(req, stream=True)
+        if resp.status_code >= 300:
+            error_body = await resp.aread()
+            await resp.aclose()
+            await client.aclose()
+            logger.error(f"UPSTREAM error {resp.status_code}: {error_body[:2000]!r}")
+            try:
+                content = json.loads(error_body)
+            except json.JSONDecodeError:
+                content = error_body.decode("utf-8", "replace")
+            return JSONResponse(
+                status_code=resp.status_code,
+                content=content,
+                headers=_anthropic_passthrough_response_headers(resp),
+            )
+
+        return StreamingResponse(
+            _stream_anthropic_passthrough(client, resp, original_model),
+            media_type="text/event-stream",
+            headers={
+                **_anthropic_passthrough_response_headers(resp),
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=outgoing, headers=headers)
+
+    if DUMP_EVENTS_UPSTREAM:
+        logger.info(f"UPSTREAM ← {resp.text[:6000]}")
+
+    try:
+        content = resp.json()
+    except json.JSONDecodeError:
+        content = resp.text
+
+    if resp.status_code < 300 and isinstance(content, dict):
+        content["model"] = original_model
+        if DUMP_EVENTS_CLAUDE:
+            logger.info(f"CLAUDE → {json.dumps(content, ensure_ascii=False)}")
+    return JSONResponse(
+        status_code=resp.status_code,
+        content=content,
+        headers=_anthropic_passthrough_response_headers(resp),
+    )
+
+
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
     try:
@@ -2476,6 +2696,14 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         logger.debug(
             f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}"
         )
+
+        # endpointType: anthropic backends speak Claude Code's own wire format,
+        # so skip the OpenAI-shaped conversion pipeline entirely and forward
+        # the request straight through.
+        if resolved.litellm_provider == "anthropic":
+            return await _anthropic_passthrough(
+                body_json, resolved, request, raw_request, display_model, resolved_display
+            )
 
         # Convert Anthropic request to LiteLLM format. This also fills in the
         # target model/provider/api_key/api_base from `resolved`.

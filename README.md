@@ -238,6 +238,34 @@ the matching entry, bypassing tier mapping entirely. The haiku/sonnet/opus
 tiers keep working unchanged for any model string that doesn't match a
 discovered alias.
 
+## Environment Variables ⚙️
+
+Everything model-routing-related lives in `router.yaml` (see above). These
+env vars (read from the process environment or a local `.env` file) control
+proxy-wide behavior that isn't per-model. All are optional; the server runs
+with sane defaults if none are set.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOG_LEVEL` | `WARN` | This proxy's own log verbosity. `DEBUG` surfaces model-mapping, stop_reason corrections, and tool-block diagnostics. |
+| `LITELLM_LOG_LEVEL` | `WARNING` | LiteLLM's internal logger verbosity, kept separate so `LOG_LEVEL=DEBUG` shows *this proxy's* diagnostics without being buried under LiteLLM's own (often harmless) traceback noise. |
+| `DUMP_EVENTS` | `none` | Which side of the translation to log: `claude` (the Claude Code ↔ proxy conversation, both directions, in Anthropic shape), `upstream` (the proxy ↔ upstream conversation, both directions, in OpenAI/litellm shape), `all` (both), or `none`. An unrecognized value logs a warning and falls back to `upstream`. |
+| `MAX_TOKENS_LIMIT` | unset (no cap) | Hard ceiling on `max_tokens`/`max_completion_tokens` sent upstream, regardless of what the client requested. Set this only if a specific gateway needs one — the proxy otherwise passes the client's value through unchanged. |
+| `STREAM_KEEPALIVE_SECONDS` | `3` | Seconds of silence mid-stream before the proxy emits an Anthropic `ping` event, so clients don't drop the connection while a large tool-call payload is buffered. `0` disables. |
+| `UPSTREAM_IDLE_TIMEOUT` | `90` | Seconds to wait for any data from the upstream before aborting the request. Guards against a gateway that returns `200` and then never streams a body. `0` disables. |
+| `ERROR_ON_EMPTY_RESPONSE` | `true` | Report a completion with no text and no tool calls as an error instead of a silent, empty turn (which would otherwise end the agent loop with nothing shown). |
+| `DISABLE_STREAM_OPTIONS` | `false` | Don't send `stream_options: {include_usage: true}`. Needed for OpenAI-compatible gateways that reject the field outright; without it, streamed responses report `output_tokens: 0` and Claude Code's context meter never moves. |
+| `ENABLE_CONTENT_REPLACEMENTS` | `false` | Enables text-rewriting passes on request/response content. Off by default because it's destructive for a coding agent (it can rewrite source code, file paths, and tool output). |
+| `PRESERVE_UPSTREAM_TOOL_IDS` | `false` | Use the backend's own `tool_use` id verbatim instead of the proxy's synthesized one. Leave this off for backends (e.g. Kimi) that derive ids from tool name + position and repeat them across turns — Anthropic requires ids to be unique per conversation, and a repeat is reported as an interrupted tool call. |
+| `CUSTOM_HEADER_<NAME>` | none | Any number of these inject a literal header on the upstream request. `<NAME>` is upper/underscore, lowercased and hyphenated to form the header name — e.g. `CUSTOM_HEADER_USER_AGENT=opencode` sends `user-agent: opencode`. Headers are also echoed back on the response to the client, except protocol-owned ones (`content-type` and similar) where doing so would break SSE streaming — the startup log states which of your configured headers fall into each group. |
+
+Reasoning-related behavior (whether a model is asked to reason at all, and how
+Claude Code's `/effort` levels map onto it) is controlled per-model in
+`router.yaml` via `disable_reasoning` and `reasoning_effort_map` — see
+[Model Routing](#model-routing-) above, not an env var. Whenever the upstream
+response actually contains a reasoning trace, the proxy surfaces it to Claude
+Code as a `thinking` block unconditionally.
+
 ## How It Works 🧩
 
 This proxy works by:

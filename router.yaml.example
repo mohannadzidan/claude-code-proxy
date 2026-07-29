@@ -49,3 +49,20 @@ models:
     providerModelName: claude-opus-4-20250514
     endpointType: anthropic
     providerApiKey: ${ANTHROPIC_API_KEY}
+    # Optional. Claude Code's `/effort` slash command sends one of
+    # low/medium/high/xhigh/max in the request; by default the proxy passes
+    # that value through unchanged (as `reasoning_effort` for OpenAI-style
+    # models, or `output_config.effort` for real Anthropic models). Use
+    # `reasoning_effort_map` to remap levels this specific model/gateway
+    # doesn't accept. Only listed keys are remapped; anything else (and
+    # anything omitted from the map) still passes through as-is.
+    #
+    # This matters for real Anthropic models in particular: older litellm
+    # versions reject `output_config.effort: "xhigh"` outright, and reject
+    # "max" for any model that doesn't match litellm's internal
+    # claude-opus-4-6-ish naming pattern -- which most current model ids
+    # (including this example's claude-opus-4-20250514) don't. Remap those
+    # down to something your installed litellm version accepts:
+    reasoning_effort_map:
+      xhigh: high
+      max: high

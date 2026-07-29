@@ -510,22 +510,11 @@ def getModel(
 # long edits on models that support far more.
 MAX_TOKENS_LIMIT = int(os.environ.get("MAX_TOKENS_LIMIT", "0")) or None
 
-# Some OpenAI-compatible gateways only understand `max_tokens` and reject
-# `max_completion_tokens`. Set FORCE_MAX_TOKENS_PARAM=max_tokens for those.
-MAX_TOKENS_PARAM = os.environ.get("FORCE_MAX_TOKENS_PARAM", "auto").lower()
-
 # The claude->Open text rewriting is destructive for a coding agent (it rewrites
 # source code, file paths and tool output). Off unless explicitly enabled.
 ENABLE_CONTENT_REPLACEMENTS = (
     os.environ.get("ENABLE_CONTENT_REPLACEMENTS", "false").lower() == "true"
 )
-
-# Surface upstream reasoning traces as Anthropic thinking blocks. Default "auto":
-# only when the client actually asked for thinking. Emitting unrequested thinking
-# blocks (and with no valid signature, which we cannot produce for a non-Anthropic
-# backend) makes clients discard the message and end the turn silently. Set to
-# "always" to force, "never" to drop reasoning entirely.
-EMIT_REASONING = os.environ.get("EMIT_REASONING", "auto").lower()
 
 # Some OpenAI-compatible gateways reject the stream_options field outright.
 DISABLE_STREAM_OPTIONS = (
@@ -576,14 +565,6 @@ STREAM_KEEPALIVE_SECONDS = float(os.environ.get("STREAM_KEEPALIVE_SECONDS", "3")
 # the log after the response headers. 0 disables.
 UPSTREAM_IDLE_TIMEOUT = float(os.environ.get("UPSTREAM_IDLE_TIMEOUT", "90"))
 
-# COMPAT_MODE=true drops every request field this proxy added over the older,
-# known-working shape: no stream_options, no `user`, and max_tokens capped at
-# 16384. Strict or older OpenAI-compatible gateways (one-api / new-api forks and
-# similar) can accept a request carrying unknown fields with 200 and then never
-# stream a body. This keeps all the response-side and tool-handling fixes while
-# sending exactly what the pre-patch proxy sent.
-COMPAT_MODE = os.environ.get("COMPAT_MODE", "false").lower() == "true"
-
 # Report an empty assistant turn as an error rather than letting it look like a
 # normal finish. An empty completion silently ends the agent loop.
 ERROR_ON_EMPTY_RESPONSE = (
@@ -596,14 +577,6 @@ ERROR_ON_EMPTY_RESPONSE = (
 # blocks out of conversation history before forwarding them upstream.
 PROXY_THINKING_SIGNATURE = base64.b64encode(b"litellm-proxy-unsigned-thinking").decode()
 
-
-def _should_emit_thinking(original_request) -> bool:
-    if EMIT_REASONING == "never":
-        return False
-    if EMIT_REASONING == "always":
-        return True
-    thinking = getattr(original_request, "thinking", None)
-    return bool(thinking is not None and thinking.is_enabled)
 
 # Reasoning models reject temperature/top_p/stop and need max_completion_tokens.
 REASONING_MODEL_PATTERN = re.compile(
@@ -1309,13 +1282,11 @@ def convert_anthropic_to_litellm(
     messages = _repair_tool_call_pairs(messages)
 
     # ---------- parameters ----------
+    # Passed through as the client sent it. MAX_TOKENS_LIMIT is the only cap,
+    # and it's opt-in -- set it explicitly if a gateway actually needs a ceiling.
     max_tokens = anthropic_request.max_tokens
     if MAX_TOKENS_LIMIT:
         max_tokens = min(max_tokens, MAX_TOKENS_LIMIT)
-    elif COMPAT_MODE and not is_anthropic_model:
-        # The pre-patch proxy hardcoded this cap; some gateways reject or stall on
-        # larger values than the backing model advertises.
-        max_tokens = min(max_tokens, 16384)
 
     litellm_request: Dict[str, Any] = {
         "model": target_model,
@@ -1331,13 +1302,8 @@ def convert_anthropic_to_litellm(
     if resolved.providerBaseUrl:
         litellm_request["api_base"] = resolved.providerBaseUrl
 
-    # Reasoning models require max_completion_tokens; some gateways only know
-    # max_tokens. `auto` picks per-model, and the env var forces one.
-    if MAX_TOKENS_PARAM == "max_tokens":
-        litellm_request["max_tokens"] = max_tokens
-    elif MAX_TOKENS_PARAM == "max_completion_tokens":
-        litellm_request["max_completion_tokens"] = max_tokens
-    elif is_reasoning_model(target_model):
+    # Reasoning models require max_completion_tokens; other models use max_tokens.
+    if is_reasoning_model(target_model):
         litellm_request["max_completion_tokens"] = max_tokens
     else:
         litellm_request["max_tokens"] = max_tokens
@@ -1395,15 +1361,11 @@ def convert_anthropic_to_litellm(
     # output_tokens: 0 for every streamed reply and Claude Code's context meter
     # never moved. Some third-party gateways reject the unknown field, so it can
     # be turned off with DISABLE_STREAM_OPTIONS=true.
-    if anthropic_request.stream and not (DISABLE_STREAM_OPTIONS or COMPAT_MODE):
+    if anthropic_request.stream and not DISABLE_STREAM_OPTIONS:
         litellm_request["stream_options"] = {"include_usage": True}
 
     # metadata.user_id -> `user` (abuse-tracking / caching hints)
-    if (
-        anthropic_request.metadata
-        and isinstance(anthropic_request.metadata, dict)
-        and not COMPAT_MODE
-    ):
+    if anthropic_request.metadata and isinstance(anthropic_request.metadata, dict):
         user_id = anthropic_request.metadata.get("user_id")
         if isinstance(user_id, str) and user_id:
             litellm_request["user"] = user_id[:128]
@@ -1730,7 +1692,7 @@ def convert_litellm_to_anthropic(
         content = []
 
         # Thinking must precede text in an Anthropic content array.
-        if _should_emit_thinking(original_request) and reasoning_text:
+        if reasoning_text:
             content.append(
                 {
                     "type": "thinking",
@@ -2188,7 +2150,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 reasoning = _block_get(delta, "reasoning_content", None) or _block_get(
                     delta, "reasoning", None
                 )
-                if _should_emit_thinking(original_request) and reasoning:
+                if reasoning:
                     if tracker.open_type != "thinking":
                         closed = tracker.close()
                         if closed:
@@ -2310,8 +2272,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 "  If text_deltas is ~1, the backend sent the whole answer in one "
                 "chunk (upstream buffering).\n"
                 "  If non_text_chunks is large and text_deltas is small, the time "
-                "went into reasoning that is being dropped -- set "
-                "EMIT_REASONING=always to stream it.\n"
+                "went into reasoning (streamed as thinking deltas above).\n"
                 "  Tool call arguments are buffered by design and always appear at "
                 "once.",
                 upstream_chunks, text_delta_count, reasoning_only,

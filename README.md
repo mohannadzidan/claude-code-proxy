@@ -137,6 +137,9 @@ models:
     displayName: "MiniMax M3"           # optional, logging/health only
     disable_reasoning: false            # set true to opt a non-reasoning
                                          # model out of reasoning_effort
+    reasoning_effort_map:                # optional, remap Claude's /effort
+      xhigh: high                        # levels this model/gateway rejects
+      max: high
 ```
 
 `id` and `providerModelName` are deliberately separate: some upstream gateways
@@ -165,6 +168,47 @@ reasoning-capable even though their name doesn't match the server's built-in
 reasoning-model pattern (`o1-o4`/`gpt-5`/`deepseek-r`/`qwq`/`grok-reasoning`).
 Set `disable_reasoning: true` on an entry for a genuinely non-reasoning model
 (e.g. `gpt-4.1`) that should just ignore thinking requests instead.
+
+### Mapping Claude's `/effort` levels per model
+
+Claude Code's `/effort` slash command doesn't touch `thinking.budget_tokens`
+for any model it doesn't recognize as one of Anthropic's own fixed-thinking
+models — which is every `router.yaml` id. Instead it sends the selected level
+(`low`/`medium`/`high`/`xhigh`/`max`) in a separate `output_config.effort`
+field. By default the proxy passes that value through **unchanged**:
+`reasoning_effort` for OpenAI-style models, or `output_config.effort` for
+`endpointType: anthropic` models.
+
+Some backends don't accept every level Claude Code can send. Use the optional
+`reasoning_effort_map` on a model entry to remap specific levels to something
+that backend understands:
+
+```yaml
+models:
+  - id: anthropic/claude-opus-4-20250514
+    providerModelName: claude-opus-4-20250514
+    endpointType: anthropic
+    providerApiKey: ${ANTHROPIC_API_KEY}
+    reasoning_effort_map:
+      xhigh: high   # this level, mapped to a level the backend accepts
+      max: high
+```
+
+Only the keys you list are remapped — every other level (including ones not
+yet invented) still passes through untouched. This is opt-in and per-model on
+purpose: it's the operator's call whether a given backend/litellm version
+needs the safety net, not something the proxy should silently impose.
+
+**Known gap this exists to cover:** litellm 1.82.x validates
+`output_config.effort` against a fixed list that does not include `"xhigh"`,
+and only allows `"max"` for model names matching its own
+`claude-opus-4-6`-ish pattern. Sending `xhigh`/`max` straight through to a
+real Anthropic-backed entry on an affected litellm version raises a
+`ValueError` from inside litellm's transformation code — set
+`reasoning_effort_map` on that entry (as above) to avoid it. This is not
+proxy-side clamping; if you're on a litellm version/backend that already
+accepts these values, leave the map unset and effort levels flow through
+verbatim.
 
 The server validates `router.yaml` at startup and refuses to start if it's
 missing, malformed, has a model entry missing a required field, or if

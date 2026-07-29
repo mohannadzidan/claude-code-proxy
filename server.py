@@ -283,6 +283,12 @@ class ModelEntry:
     # non-reasoning model (gpt-4.1, ...) that should ignore thinking requests
     # instead.
     disable_reasoning: Optional[bool] = None
+    # Optional per-model remap of Claude Code's /effort levels (low/medium/
+    # high/xhigh/max) onto whatever string this specific upstream expects for
+    # reasoning_effort / output_config.effort, e.g. {"xhigh": "high", "max":
+    # "high"} for a backend that only understands the classic 3-tier scale.
+    # Unmapped levels pass through unchanged; unset means no remapping at all.
+    reasoning_effort_map: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -294,6 +300,7 @@ class ResolvedModel:
     providerBaseUrl: Optional[str] = None
     displayName: Optional[str] = None
     disable_reasoning: Optional[bool] = None
+    reasoning_effort_map: Optional[Dict[str, str]] = None
 
     @property
     def litellm_model(self) -> str:
@@ -344,6 +351,14 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
             )
 
         raw_disable_reasoning = entry.get("disable_reasoning")
+        raw_effort_map = entry.get("reasoning_effort_map")
+        if raw_effort_map is not None:
+            if not isinstance(raw_effort_map, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in raw_effort_map.items()
+            ):
+                raise RouterConfigError(
+                    f"Entry {idx}: 'reasoning_effort_map' must be a mapping of string to string"
+                )
         models.append(
             ModelEntry(
                 id=entry["id"],
@@ -355,6 +370,7 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
                 disable_reasoning=(
                     bool(raw_disable_reasoning) if raw_disable_reasoning is not None else None
                 ),
+                reasoning_effort_map=raw_effort_map,
             )
         )
         ids_seen.add(entry["id"])
@@ -439,6 +455,7 @@ def _resolve_entry(entry: ModelEntry) -> ResolvedModel:
         providerBaseUrl=entry.providerBaseUrl,
         displayName=entry.displayName,
         disable_reasoning=entry.disable_reasoning,
+        reasoning_effort_map=entry.reasoning_effort_map,
     )
 
 
@@ -622,37 +639,29 @@ def supports_reasoning_effort(resolved: "ResolvedModel") -> bool:
     return True
 
 
-# Anthropic's `output_config.effort` levels mapped onto the coarser 3-tier
-# scale that both OpenAI's `reasoning_effort` and the installed litellm
-# version's Anthropic `output_config` validation (only low/medium/high/max,
-# and "max" only for models it recognises as Claude-4.6-family) accept.
-# "xhigh"/"max" are clamped down to "high" rather than forwarded verbatim,
-# which would otherwise raise inside litellm for any router.yaml model name
-# it doesn't recognise (i.e. all of them).
-_CLIENT_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
-_EFFORT_TO_REASONING_EFFORT = {
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "xhigh": "high",
-    "max": "high",
-}
-
-
-def _client_effort_level(anthropic_request: "MessagesRequest") -> Optional[str]:
-    """Read the /effort level Claude Code actually varies, already clamped.
+def _client_effort_level(
+    anthropic_request: "MessagesRequest", resolved: "ResolvedModel"
+) -> Optional[str]:
+    """Read the /effort level Claude Code actually varies.
 
     `thinking.budget_tokens` is not it: for any model name Claude Code doesn't
     recognize as an older fixed-thinking model (every router.yaml id/alias
     qualifies), it sends adaptive thinking with no budget_tokens at all and
     carries the effort level in this separate field instead.
+
+    Passed through as-is (whatever Claude Code sent: low/medium/high/xhigh/
+    max/future values) unless the model entry's optional `reasoningEffortMap`
+    remaps it -- e.g. a model whose own `reasoning_effort` param, or whose
+    litellm version's Anthropic `output_config` validation, doesn't recognise
+    "xhigh"/"max" can map those down to "high" in router.yaml.
     """
     output_config = getattr(anthropic_request, "output_config", None)
-    if isinstance(output_config, dict):
-        effort = output_config.get("effort")
-        if effort in _CLIENT_EFFORT_LEVELS:
-            return _EFFORT_TO_REASONING_EFFORT[effort]
-    return None
+    if not isinstance(output_config, dict):
+        return None
+    effort = output_config.get("effort")
+    if not isinstance(effort, str) or not effort:
+        return None
+    return (resolved.reasoning_effort_map or {}).get(effort, effort)
 
 
 def supports_temperature(model: str) -> bool:
@@ -1358,7 +1367,7 @@ def convert_anthropic_to_litellm(
     # `client_effort_level` (when present) takes priority over the
     # budget_tokens heuristic, which now only matters for older Anthropic
     # clients that set an explicit numeric budget with no effort field.
-    client_effort = _client_effort_level(anthropic_request)
+    client_effort = _client_effort_level(anthropic_request, resolved)
     if anthropic_request.thinking is not None and anthropic_request.thinking.is_enabled:
         if is_anthropic_model:
             thinking_payload = {"type": "enabled"}
@@ -2133,7 +2142,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
                     )
                     logger.warning(
-                        f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)[:600]}"
+                        f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)}"
                     )
 
                 # While tool arguments accumulate the proxy emits no content at
@@ -2561,7 +2570,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                     else litellm_response
                 )
                 logger.warning(
-                    f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)[:1500]}"
+                    f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)}"
                 )
 
             # Convert LiteLLM response to Anthropic format
@@ -2573,7 +2582,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                     else anthropic_response
                 )
                 logger.warning(
-                    f"CLAUDE-> {json.dumps(_dump, ensure_ascii=False, default=str)[:1500]}"
+                    f"CLAUDE-> {json.dumps(_dump, ensure_ascii=False, default=str)}"
                 )
 
             return anthropic_response

@@ -27,11 +27,60 @@ sys.stdout.reconfigure(encoding='utf-8')
 load_dotenv()
 
 
-# Configure logging. LOG_LEVEL=DEBUG surfaces the model mapping, stop_reason
-# corrections and tool-block diagnostics; the default stays quiet.
+# Configure logging. Default level is INFO: startup config (router.yaml,
+# custom headers) and DUMP_EVENTS traffic dumps show up out of the box once
+# DUMP_EVENTS is set. LOG_LEVEL=DEBUG additionally surfaces stop_reason
+# corrections and tool-block diagnostics. LOG_LEVEL=WARNING silences
+# everything except actual anomalies (dropped tools, malformed tool args,
+# empty completions, etc).
+#
+# Rendering is handled by rich's RichHandler instead of a hand-rolled
+# formatter: it dims the timestamp and colors the level name per-level for
+# free. On top of that we layer a highlighter so DUMP_EVENTS logs (e.g.
+# "UPSTREAM ← ...", "CLAUDE → ...") are easy to scan: CLAUDE/UPSTREAM get a
+# dimmed identity color, and the arrow itself shows direction:
+# → is data leaving the proxy, ← is data arriving at the proxy.
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.highlighter import RegexHighlighter
+from rich.theme import Theme
+
+
+class ProxyLogHighlighter(RegexHighlighter):
+    """Colors the CLAUDE/UPSTREAM tags and →/← direction arrows in traffic dump logs."""
+
+    base_style = "logtag."
+    highlights = [
+        r"\b(?P<claude_tag>CLAUDE)\b",
+        r"\b(?P<upstream_tag>UPSTREAM)\b",
+        r"(?P<arrow_out>→)",
+        r"(?P<arrow_in>←)",
+    ]
+
+
+_log_theme = Theme(
+    {
+        "logtag.claude_tag": "dim orange3",
+        "logtag.upstream_tag": "dim blue",
+        "logtag.arrow_out": "bold green",
+        "logtag.arrow_in": "bold yellow",
+    }
+)
+_log_console = Console(theme=_log_theme)
+
 logging.basicConfig(
-    level=getattr(logging, os.environ.get("LOG_LEVEL", "WARN").upper(), logging.WARN),
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[
+        RichHandler(
+            console=_log_console,
+            show_path=False,
+            markup=False,
+            omit_repeated_times=False,
+            highlighter=ProxyLogHighlighter(),
+        )
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -160,31 +209,6 @@ for _n in ("litellm", "LiteLLM Proxy", "LiteLLM Router"):
         getattr(logging, os.environ.get("LITELLM_LOG_LEVEL", "WARNING").upper(), logging.WARNING)
     )
 
-
-# Custom formatter for model mapping logs
-class ColorizedFormatter(logging.Formatter):
-    """Custom formatter to highlight model mappings"""
-
-    BLUE = "\033[94m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    RED = "\033[91m"
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
-
-    def format(self, record):
-        if record.levelno == logging.debug and "MODEL MAPPING" in record.msg:
-            # Apply colors and formatting to model mapping logs
-            return f"{self.BOLD}{self.GREEN}{record.msg}{self.RESET}"
-        return super().format(record)
-
-
-# Apply custom formatter to console handler
-for handler in logger.handlers:
-    if isinstance(handler, logging.StreamHandler):
-        handler.setFormatter(
-            ColorizedFormatter("%(asctime)s - %(levelname)s - %(message)s")
-        )
 
 app = FastAPI()
 
@@ -426,7 +450,7 @@ except RouterConfigError as e:
     logger.critical(str(e))
     sys.exit(1)
 
-logger.warning(
+logger.info(
     f"Loaded router.yaml: {len(ROUTER_CONFIG.models)} model entries. "
     f"Preferred: {ROUTER_CONFIG.preferredModel}"
 )
@@ -899,16 +923,16 @@ async def startup_event():
             n for n in CUSTOM_HEADERS if n.lower() in RESPONSE_PROTECTED_HEADERS
         ]
         applied = [n for n in CUSTOM_HEADERS if n.lower() not in RESPONSE_PROTECTED_HEADERS]
-        logger.warning(
+        logger.info(
             f"Custom headers: {len(applied)} sent upstream and echoed on responses, "
             f"{len(upstream_only)} sent upstream only"
         )
         for name in applied:
             value = CUSTOM_HEADERS[name]
             display_value = value if len(value) < 20 else value[:6] + "..."
-            logger.warning(f"  {name}: {display_value}")
+            logger.info(f"  {name}: {display_value}")
         for name in upstream_only:
-            logger.warning(
+            logger.info(
                 f"  {name}: {CUSTOM_HEADERS[name]}  [upstream only - overriding this "
                 f"on responses would break SSE streaming]"
             )
@@ -1955,7 +1979,7 @@ def _sse(event_type: str, payload: Dict[str, Any]) -> str:
     # Arrow direction is relative to the proxy throughout DUMP_EVENTS logging:
     # "X->" is the proxy sending to X, "X<-" is the proxy receiving from X.
     if DUMP_EVENTS_CLAUDE:
-        logger.warning(f"CLAUDE-> {event_type}: {json.dumps(payload, ensure_ascii=False)[:600]}")
+        logger.info(f"CLAUDE → {event_type}: {json.dumps(payload, ensure_ascii=False)[:600]}")
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
@@ -2103,8 +2127,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     _raw = (
                         chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
                     )
-                    logger.warning(
-                        f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)}"
+                    logger.info(
+                        f"UPSTREAM ← {json.dumps(_raw, ensure_ascii=False, default=str)}"
                     )
 
                 # While tool arguments accumulate the proxy emits no content at
@@ -2265,7 +2289,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             now = time.monotonic()
             ttfc = (first_chunk_at - stream_started_at) if first_chunk_at else -1
             reasoning_only = upstream_chunks - text_delta_count
-            logger.warning(
+            logger.info(
                 "STREAM-PROFILE: upstream_chunks=%d text_deltas=%d "
                 "non_text_chunks=%d tool_calls=%d "
                 "time_to_first_chunk=%.2fs total=%.2fs\n"
@@ -2422,8 +2446,8 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         body_json = json.loads(body.decode("utf-8"))
         if DUMP_EVENTS_CLAUDE:
             # The literal wire body Claude Code sent, before any transformation --
-            # the receiving-end counterpart to the CLAUDE-> response/event dumps.
-            # Compacted the same way as UPSTREAM->: bulky fields collapse to
+            # the receiving-end counterpart to the CLAUDE → response/event dumps.
+            # Compacted the same way as UPSTREAM →: bulky fields collapse to
             # their shape (roles/names) instead of dumping full message/tool
             # content, which would otherwise blow past the log line cap.
             _dump = {
@@ -2434,7 +2458,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 m.get("role") for m in body_json.get("messages", []) if isinstance(m, dict)
             ]
 
-            logger.warning(f"CLAUDE<- {json.dumps(_dump, ensure_ascii=False)}")
+            logger.info(f"CLAUDE ← {json.dumps(_dump, ensure_ascii=False)}")
         original_model = body_json.get("model", "unknown")
 
         # Get the display name for logging, just the model name without provider prefix
@@ -2469,7 +2493,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 if k not in ("api_key", "messages", "tools", "extra_headers")
             }
             _dump["message_roles"] = [m.get("role") for m in litellm_request["messages"]][:1500]
-            logger.warning(f"UPSTREAM-> {json.dumps(_dump, ensure_ascii=False)}")
+            logger.info(f"UPSTREAM → {json.dumps(_dump, ensure_ascii=False)}")
 
         # Only log basic info about the request, not the full details
         logger.debug(
@@ -2530,8 +2554,8 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                     if hasattr(litellm_response, "model_dump")
                     else litellm_response
                 )
-                logger.warning(
-                    f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)}"
+                logger.info(
+                    f"UPSTREAM ← {json.dumps(_raw, ensure_ascii=False, default=str)}"
                 )
 
             # Convert LiteLLM response to Anthropic format
@@ -2542,8 +2566,8 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                     if hasattr(anthropic_response, "model_dump")
                     else anthropic_response
                 )
-                logger.warning(
-                    f"CLAUDE-> {json.dumps(_dump, ensure_ascii=False, default=str)}"
+                logger.info(
+                    f"CLAUDE → {json.dumps(_dump, ensure_ascii=False, default=str)}"
                 )
 
             return anthropic_response

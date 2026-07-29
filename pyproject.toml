@@ -14,5 +14,6 @@ dependencies = [
     "google-auth>=2.41.1",
     "google-cloud-aiplatform>=1.120.0",
     "pyyaml>=6.0",
+    "rich>=14.3.3",
 ]
 

@@ -515,10 +515,37 @@ DISABLE_STREAM_OPTIONS = (
     os.environ.get("DISABLE_STREAM_OPTIONS", "false").lower() == "true"
 )
 
-# DUMP_EVENTS=true logs every Anthropic SSE event the proxy emits, plus the
-# outgoing upstream payload. This is the fastest way to see what a client is
-# actually receiving when a turn ends unexpectedly.
-DUMP_EVENTS = os.environ.get("DUMP_EVENTS", "false").lower() == "true"
+# DUMP_EVENTS controls which side of the translation gets logged:
+#   claude   - the Claude Code <-> proxy conversation in Anthropic shape: the
+#              raw request Claude Code sent (before transformation) and the
+#              events/response the proxy sends back (after transformation)
+#   upstream - the proxy <-> upstream conversation in OpenAI/litellm shape:
+#              the request sent to, and events/response received from, the
+#              upstream provider/model directly
+#   all      - both of the above
+#   none     - nothing (default when unset)
+# An unrecognized value logs a warning and falls back to "upstream", since
+# that's the side most debugging sessions actually need.
+_VALID_DUMP_EVENTS_MODES = {"none", "claude", "upstream", "all"}
+
+
+def _parse_dump_events_mode() -> str:
+    raw = os.environ.get("DUMP_EVENTS")
+    if not raw:
+        return "none"
+    mode = raw.strip().lower()
+    if mode not in _VALID_DUMP_EVENTS_MODES:
+        logger.warning(
+            f"Invalid DUMP_EVENTS={raw!r} (expected one of "
+            f"{sorted(_VALID_DUMP_EVENTS_MODES)}); falling back to 'upstream'"
+        )
+        return "upstream"
+    return mode
+
+
+DUMP_EVENTS_MODE = _parse_dump_events_mode()
+DUMP_EVENTS_CLAUDE = DUMP_EVENTS_MODE in ("claude", "all")
+DUMP_EVENTS_UPSTREAM = DUMP_EVENTS_MODE in ("upstream", "all")
 
 # Seconds of silence before the proxy emits a keep-alive ping mid-stream. Tool
 # calls are buffered until the stream ends, so a large Edit/Write payload can
@@ -593,6 +620,39 @@ def supports_reasoning_effort(resolved: "ResolvedModel") -> bool:
     if resolved.disable_reasoning:
         return False
     return True
+
+
+# Anthropic's `output_config.effort` levels mapped onto the coarser 3-tier
+# scale that both OpenAI's `reasoning_effort` and the installed litellm
+# version's Anthropic `output_config` validation (only low/medium/high/max,
+# and "max" only for models it recognises as Claude-4.6-family) accept.
+# "xhigh"/"max" are clamped down to "high" rather than forwarded verbatim,
+# which would otherwise raise inside litellm for any router.yaml model name
+# it doesn't recognise (i.e. all of them).
+_CLIENT_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+_EFFORT_TO_REASONING_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
+
+def _client_effort_level(anthropic_request: "MessagesRequest") -> Optional[str]:
+    """Read the /effort level Claude Code actually varies, already clamped.
+
+    `thinking.budget_tokens` is not it: for any model name Claude Code doesn't
+    recognize as an older fixed-thinking model (every router.yaml id/alias
+    qualifies), it sends adaptive thinking with no budget_tokens at all and
+    carries the effort level in this separate field instead.
+    """
+    output_config = getattr(anthropic_request, "output_config", None)
+    if isinstance(output_config, dict):
+        effort = output_config.get("effort")
+        if effort in _CLIENT_EFFORT_LEVELS:
+            return _EFFORT_TO_REASONING_EFFORT[effort]
+    return None
 
 
 def supports_temperature(model: str) -> bool:
@@ -1287,20 +1347,40 @@ def convert_anthropic_to_litellm(
             litellm_request["stop"] = anthropic_request.stop_sequences[:4]
 
     # Map Anthropic's thinking budget onto OpenAI's reasoning_effort.
+    #
+    # Claude Code's `/effort` command does NOT vary `thinking.budget_tokens`.
+    # For any model name it doesn't recognize as an older fixed-thinking model
+    # -- which is every router.yaml id/alias -- it sends adaptive thinking
+    # (`thinking: {"type": "adaptive"}`, no budget_tokens at all) and carries
+    # the actual effort level in the separate `output_config.effort` field
+    # instead. Every request therefore had budget=0 and fell through to the
+    # `else: "medium"` bucket below regardless of the effort level chosen, so
+    # `client_effort_level` (when present) takes priority over the
+    # budget_tokens heuristic, which now only matters for older Anthropic
+    # clients that set an explicit numeric budget with no effort field.
+    client_effort = _client_effort_level(anthropic_request)
     if anthropic_request.thinking is not None and anthropic_request.thinking.is_enabled:
         if is_anthropic_model:
             thinking_payload = {"type": "enabled"}
             if anthropic_request.thinking.budget_tokens:
                 thinking_payload["budget_tokens"] = anthropic_request.thinking.budget_tokens
             litellm_request["thinking"] = thinking_payload
+            if client_effort:
+                # The real Anthropic-compatible backend understands effort
+                # natively; forward it alongside thinking rather than losing
+                # the client's /effort selection entirely.
+                litellm_request["output_config"] = {"effort": client_effort}
         elif supports_reasoning_effort(resolved):
-            budget = anthropic_request.thinking.budget_tokens or 0
-            if budget and budget <= 4096:
-                litellm_request["reasoning_effort"] = "low"
-            elif budget and budget >= 16384:
-                litellm_request["reasoning_effort"] = "high"
+            if client_effort:
+                litellm_request["reasoning_effort"] = client_effort
             else:
-                litellm_request["reasoning_effort"] = "medium"
+                budget = anthropic_request.thinking.budget_tokens or 0
+                if budget and budget <= 4096:
+                    litellm_request["reasoning_effort"] = "low"
+                elif budget and budget >= 16384:
+                    litellm_request["reasoning_effort"] = "high"
+                else:
+                    litellm_request["reasoning_effort"] = "medium"
 
     # Streaming usage is opt-in on OpenAI. Without this the proxy reported
     # output_tokens: 0 for every streamed reply and Claude Code's context meter
@@ -1901,8 +1981,10 @@ def _client_tool_id(upstream_id: Any, tool_name: Any = None) -> str:
 
 
 def _sse(event_type: str, payload: Dict[str, Any]) -> str:
-    if DUMP_EVENTS:
-        logger.warning(f"SSE-> {event_type}: {json.dumps(payload, ensure_ascii=False)[:600]}")
+    # Arrow direction is relative to the proxy throughout DUMP_EVENTS logging:
+    # "X->" is the proxy sending to X, "X<-" is the proxy receiving from X.
+    if DUMP_EVENTS_CLAUDE:
+        logger.warning(f"CLAUDE-> {event_type}: {json.dumps(payload, ensure_ascii=False)[:600]}")
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
@@ -2045,6 +2127,14 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 upstream_chunks += 1
                 if first_chunk_at is None:
                     first_chunk_at = time.monotonic()
+
+                if DUMP_EVENTS_UPSTREAM:
+                    _raw = (
+                        chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+                    )
+                    logger.warning(
+                        f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)[:600]}"
+                    )
 
                 # While tool arguments accumulate the proxy emits no content at
                 # all. On a large Edit/Write that is tens of seconds of dead air,
@@ -2200,7 +2290,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 logger.error(f"Error processing chunk: {chunk_error}")
                 continue
 
-        if DUMP_EVENTS:
+        if DUMP_EVENTS_MODE != "none":
             now = time.monotonic()
             ttfc = (first_chunk_at - stream_started_at) if first_chunk_at else -1
             reasoning_only = upstream_chunks - text_delta_count
@@ -2231,7 +2321,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 "(upstream_chunks=%d, finish_reason=%s, input_tokens=%s). "
                 "Common causes: prompt exceeded the backend's context window, "
                 "upstream content filter, or an unrecognised response shape. "
-                "Run with DUMP_EVENTS=true to see the raw stream.",
+                "Run with DUMP_EVENTS=upstream to see the raw stream.",
                 upstream_chunks, stop_reason, input_tokens or "unknown",
             )
             if ERROR_ON_EMPTY_RESPONSE:
@@ -2360,6 +2450,21 @@ async def create_message(request: MessagesRequest, raw_request: Request):
 
         # Parse the raw body as JSON since it's bytes
         body_json = json.loads(body.decode("utf-8"))
+        if DUMP_EVENTS_CLAUDE:
+            # The literal wire body Claude Code sent, before any transformation --
+            # the receiving-end counterpart to the CLAUDE-> response/event dumps.
+            # Compacted the same way as UPSTREAM->: bulky fields collapse to
+            # their shape (roles/names) instead of dumping full message/tool
+            # content, which would otherwise blow past the log line cap.
+            _dump = {
+                k: v for k, v in body_json.items()
+                if k not in ("messages", "tools", "system")
+            }
+            _dump["message_roles"] = [
+                m.get("role") for m in body_json.get("messages", []) if isinstance(m, dict)
+            ]
+
+            logger.warning(f"CLAUDE<- {json.dumps(_dump, ensure_ascii=False)}")
         original_model = body_json.get("model", "unknown")
 
         # Get the display name for logging, just the model name without provider prefix
@@ -2388,16 +2493,13 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         # re-flattening them here would have thrown that structure away again.
         _validate_openai_messages(litellm_request)
 
-        if DUMP_EVENTS:
+        if DUMP_EVENTS_UPSTREAM:
             _dump = {
                 k: v for k, v in litellm_request.items()
                 if k not in ("api_key", "messages", "tools", "extra_headers")
             }
-            _dump["message_roles"] = [m.get("role") for m in litellm_request["messages"]]
-            _dump["tool_names"] = [
-                t["function"]["name"] for t in litellm_request.get("tools", [])
-            ]
-            logger.warning(f"UPSTREAM-> {json.dumps(_dump, ensure_ascii=False)[:1500]}")
+            _dump["message_roles"] = [m.get("role") for m in litellm_request["messages"]][:1500]
+            logger.warning(f"UPSTREAM-> {json.dumps(_dump, ensure_ascii=False)}")
 
         # Only log basic info about the request, not the full details
         logger.debug(
@@ -2452,9 +2554,27 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             logger.debug(
                 f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s"
             )
+            if DUMP_EVENTS_UPSTREAM:
+                _raw = (
+                    litellm_response.model_dump()
+                    if hasattr(litellm_response, "model_dump")
+                    else litellm_response
+                )
+                logger.warning(
+                    f"UPSTREAM<- {json.dumps(_raw, ensure_ascii=False, default=str)[:1500]}"
+                )
 
             # Convert LiteLLM response to Anthropic format
             anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+            if DUMP_EVENTS_CLAUDE:
+                _dump = (
+                    anthropic_response.model_dump()
+                    if hasattr(anthropic_response, "model_dump")
+                    else anthropic_response
+                )
+                logger.warning(
+                    f"CLAUDE-> {json.dumps(_dump, ensure_ascii=False, default=str)[:1500]}"
+                )
 
             return anthropic_response
 

@@ -276,10 +276,13 @@ class ModelEntry:
     providerApiKey: str
     providerBaseUrl: Optional[str] = None
     displayName: Optional[str] = None
-    # Explicit override for reasoning-capable OpenAI-compatible models (glm,
-    # minimax, nemotron, ...) that REASONING_MODEL_PATTERN's name-based
-    # whitelist doesn't recognise. None means "fall back to the pattern".
-    reasoning: Optional[bool] = None
+    # Most OpenAI-compatible gateway models are reasoning-capable even when
+    # their name doesn't match REASONING_MODEL_PATTERN (glm, minimax,
+    # nemotron, ...), so `reasoning_effort` is forwarded by default whenever
+    # the client requests extended thinking. Set true here for the rare
+    # non-reasoning model (gpt-4.1, ...) that should ignore thinking requests
+    # instead.
+    disable_reasoning: Optional[bool] = None
 
 
 @dataclass
@@ -290,7 +293,7 @@ class ResolvedModel:
     providerApiKey: str
     providerBaseUrl: Optional[str] = None
     displayName: Optional[str] = None
-    reasoning: Optional[bool] = None
+    disable_reasoning: Optional[bool] = None
 
     @property
     def litellm_model(self) -> str:
@@ -340,7 +343,7 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
                 f"(must be one of {sorted(VALID_ENDPOINT_TYPES)})"
             )
 
-        raw_reasoning = entry.get("reasoning")
+        raw_disable_reasoning = entry.get("disable_reasoning")
         models.append(
             ModelEntry(
                 id=entry["id"],
@@ -349,7 +352,9 @@ def _parse_router_config(raw: Dict[str, Any]) -> RouterConfig:
                 providerApiKey=entry["providerApiKey"],
                 providerBaseUrl=entry.get("providerBaseUrl") or None,
                 displayName=entry.get("displayName") or None,
-                reasoning=bool(raw_reasoning) if raw_reasoning is not None else None,
+                disable_reasoning=(
+                    bool(raw_disable_reasoning) if raw_disable_reasoning is not None else None
+                ),
             )
         )
         ids_seen.add(entry["id"])
@@ -431,7 +436,7 @@ def getModel(tier: Optional[Literal["haiku", "sonnet", "opus"]] = None) -> Resol
                 providerApiKey=entry.providerApiKey,
                 providerBaseUrl=entry.providerBaseUrl,
                 displayName=entry.displayName,
-                reasoning=entry.reasoning,
+                disable_reasoning=entry.disable_reasoning,
             )
 
     # Startup validation guarantees every preferred* id resolves; this only
@@ -532,17 +537,17 @@ def is_reasoning_model(model: str) -> bool:
 def supports_reasoning_effort(resolved: "ResolvedModel") -> bool:
     """True when `reasoning_effort` should be forwarded for this upstream model.
 
-    REASONING_MODEL_PATTERN only recognises OpenAI's own reasoning-model
-    naming (o1-o4, gpt-5, ...). Reasoning-capable models served through
-    OpenAI-compatible gateways (glm, minimax, nemotron, ...) don't match that
-    pattern and never got `reasoning_effort`, so they silently never reasoned
-    even when the client asked for extended thinking. router.yaml's
-    `reasoning: true/false` on a model entry overrides the pattern; when unset
-    the pattern is the fallback.
+    Only consulted once the client has already requested extended thinking,
+    so defaulting to True is correct for the common case: most
+    OpenAI-compatible gateway models (glm, minimax, nemotron, ...) are
+    reasoning-capable even though their name doesn't match
+    REASONING_MODEL_PATTERN (which only covers OpenAI's own o1-o4/gpt-5
+    naming). Set `disable_reasoning: true` on a model entry for the rare
+    non-reasoning model that should ignore thinking requests instead.
     """
-    if resolved.reasoning is not None:
-        return resolved.reasoning
-    return is_reasoning_model(resolved.litellm_model)
+    if resolved.disable_reasoning:
+        return False
+    return True
 
 
 def supports_temperature(model: str) -> bool:

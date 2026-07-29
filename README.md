@@ -135,8 +135,8 @@ models:
     providerBaseUrl: https://api.example.com/v1  # empty/omitted = provider default
     providerApiKey: ${MINIMAX_API_KEY}  # supports ${VAR} / ${VAR:-default}
     displayName: "MiniMax M3"           # optional, logging/health only
-    reasoning: true                     # forces reasoning_effort for models
-                                         # the built-in name pattern misses
+    disable_reasoning: false            # set true to opt a non-reasoning
+                                         # model out of reasoning_effort
 ```
 
 `id` and `providerModelName` are deliberately separate: some upstream gateways
@@ -157,6 +157,14 @@ gets treated as empty and discarded, so extended-thinking output vanishes
 mid-stream even though the upstream bytes clearly contain it. `hosted_vllm`
 handles the identical request/response shape but has a working
 reasoning_content path in streaming. This is invisible from router.yaml.
+
+`disable_reasoning` defaults to unset, meaning `thinking` requests from the
+client are forwarded upstream as `reasoning_effort` for every model — most
+OpenAI-compatible gateway models (glm, minimax, nemotron, ...) are
+reasoning-capable even though their name doesn't match the server's built-in
+reasoning-model pattern (`o1-o4`/`gpt-5`/`deepseek-r`/`qwq`/`grok-reasoning`).
+Set `disable_reasoning: true` on an entry for a genuinely non-reasoning model
+(e.g. `gpt-4.1`) that should just ignore thinking requests instead.
 
 The server validates `router.yaml` at startup and refuses to start if it's
 missing, malformed, has a model entry missing a required field, or if

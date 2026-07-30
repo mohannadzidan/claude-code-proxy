@@ -3,6 +3,7 @@ import { PORT, CUSTOM_HEADERS, RESPONSE_PROTECTED_HEADERS } from "./env.js";
 import { logger } from "./logger.js";
 import { ROUTER_CONFIG } from "./router/config.js";
 import { registerMiscRoutes } from "./routes/misc.js";
+import { registerCountTokensRoute } from "./routes/countTokens.js";
 
 // Fastify's own request logger is disabled: all logging in this port goes
 // through our pino instance (logger.ts) plus the human-friendly
@@ -28,6 +29,7 @@ app.addHook("onSend", async (_request, reply, payload) => {
 });
 
 registerMiscRoutes(app);
+registerCountTokensRoute(app);
 
 if (Object.keys(CUSTOM_HEADERS).length > 0) {
   const upstreamOnly = Object.keys(CUSTOM_HEADERS).filter((n) => RESPONSE_PROTECTED_HEADERS.has(n.toLowerCase()));

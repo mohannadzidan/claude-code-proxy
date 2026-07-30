@@ -8,6 +8,7 @@ import { handleStreaming } from "../streaming/handleStreaming.js";
 import { completeChat, streamChat } from "../providers/dispatch.js";
 import { anthropicPassthrough, type PassthroughResult } from "../providers/anthropicPassthrough.js";
 import { ProviderHttpError } from "../providers/httpError.js";
+import { ZodError } from "zod";
 import { applyContentReplacements } from "../contentReplacements.js";
 import { DUMP_EVENTS_CLAUDE, DUMP_EVENTS_UPSTREAM } from "../env.js";
 import { logger, logRequestBeautifully } from "../logger.js";
@@ -124,8 +125,12 @@ export function registerMessagesRoute(app: FastifyInstance): void {
       const err = e as Error;
       logger.error(`Error processing request: ${err.message}\n${err.stack}`);
 
-      const statusCode = e instanceof ProviderHttpError ? e.statusCode : 500;
-      const message = err.message || String(e);
+      let statusCode = e instanceof ProviderHttpError ? e.statusCode : 500;
+      let message = err.message || String(e);
+      if (e instanceof ZodError) {
+        statusCode = 400;
+        message = `Invalid request: ${JSON.stringify(e.issues)}`;
+      }
 
       let resolvedDisplayForError = parsed?.model || "unknown";
       try {

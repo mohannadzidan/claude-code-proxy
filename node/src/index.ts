@@ -5,6 +5,7 @@ import { ROUTER_CONFIG } from "./router/config.js";
 import { registerMiscRoutes } from "./routes/misc.js";
 import { registerCountTokensRoute } from "./routes/countTokens.js";
 import { registerMessagesRoute } from "./routes/messages.js";
+import { anthropicErrorBody } from "./errors.js";
 
 // Fastify's own request logger is disabled: all logging in this port goes
 // through our pino instance (logger.ts) plus the human-friendly
@@ -32,6 +33,21 @@ app.addHook("onSend", async (_request, reply, payload) => {
 registerMiscRoutes(app);
 registerCountTokensRoute(app);
 registerMessagesRoute(app);
+
+// Anthropic clients parse {"type":"error","error":{...}}. Anything Fastify
+// itself rejects before a route handler runs (malformed JSON body, an
+// unmatched route, ...) would otherwise surface in Claude Code as an opaque
+// "API Error" with no message, the same failure mode server.py's
+// validation_exception_handler/http_exception_handler exist to avoid.
+app.setErrorHandler((error: Error & { statusCode?: number }, request, reply) => {
+  const statusCode = error.statusCode && error.statusCode >= 400 ? error.statusCode : 500;
+  logger.warn(`Unhandled request error: ${request.method} ${request.url}: ${error.message}`);
+  reply.code(statusCode).send(anthropicErrorBody(statusCode, error.message));
+});
+
+app.setNotFoundHandler((request, reply) => {
+  reply.code(404).send(anthropicErrorBody(404, `Not found: ${request.method} ${request.url}`));
+});
 
 if (Object.keys(CUSTOM_HEADERS).length > 0) {
   const upstreamOnly = Object.keys(CUSTOM_HEADERS).filter((n) => RESPONSE_PROTECTED_HEADERS.has(n.toLowerCase()));

@@ -5,6 +5,7 @@ import { convertAnthropicToProviderRequest } from "../convert/toProvider.js";
 import { approxTextTokens, approxTokenCount } from "../tokenCounter.js";
 import { logger, logRequestBeautifully } from "../logger.js";
 import { anthropicErrorBody } from "../errors.js";
+import { ZodError } from "zod";
 
 export function registerCountTokensRoute(app: FastifyInstance): void {
   app.post("/v1/messages/count_tokens", async (request, reply) => {
@@ -54,6 +55,11 @@ export function registerCountTokensRoute(app: FastifyInstance): void {
 
       return { input_tokens: tokenCount };
     } catch (e) {
+      if (e instanceof ZodError) {
+        logger.warn(`Request validation failed: ${JSON.stringify(e.issues)}`);
+        reply.code(400);
+        return anthropicErrorBody(400, `Invalid request: ${JSON.stringify(e.issues)}`);
+      }
       logger.error(`Error counting tokens: ${(e as Error).message}\n${(e as Error).stack}`);
       reply.code(500);
       return anthropicErrorBody(500, `Error counting tokens: ${(e as Error).message}`);
